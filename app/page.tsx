@@ -22,6 +22,7 @@ interface SavedSearchMeta {
   count: number;
 }
 type Stage = "idle" | "searching" | "enriching" | "complete" | "error";
+type SearchMode = "postcode" | "company";
 const BATCH_SIZE = 10;
 const DESCRIBE_BATCH_SIZE = 10;
 const CONCURRENT_DESCRIBE = 2;
@@ -34,6 +35,12 @@ function parsePostcodes(input: string): string[] {
     .split(/[\s,;]+/)
     .map((s) => s.trim())
     .filter((s) => /^\d{5}$/.test(s));
+}
+function parseCompanyNames(input: string): string[] {
+  return input
+    .split(/[,;\n]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
 }
 function tierBadge(tier: string) {
   const styles: Record<string, string> = {
@@ -52,6 +59,7 @@ function tierBadge(tier: string) {
 }
 export default function Home() {
   const [input, setInput] = useState("");
+  const [searchMode, setSearchMode] = useState<SearchMode>("postcode");
   const [stage, setStage] = useState<Stage>("idle");
   const [places, setPlaces] = useState<Place[]>([]);
   const [enrichedCount, setEnrichedCount] = useState(0);
@@ -77,12 +85,13 @@ export default function Home() {
     setSavingState("saving");
     try {
       const postcodesStr = [...new Set(places.map((p) => p.postcode).filter(Boolean))].join(", ");
+      const saveName = postcodesStr ? `Search ${postcodesStr}` : `Company lookup: ${input.slice(0, 60)}`;
       const res = await fetch("/api/saves", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: `Search ${postcodesStr}`,
-          postcodes: postcodesStr,
+          name: saveName,
+          postcodes: postcodesStr || input.slice(0, 100),
           places: places.map((p) => ({
             name: p.name, category: p.category, address: p.address,
             phone: p.phone, website: p.website, lat: p.lat, lng: p.lng,
@@ -183,9 +192,17 @@ export default function Home() {
     await Promise.all(workers);
   }, []);
   const runPipeline = useCallback(async () => {
-    const postcodes = parsePostcodes(input);
-    if (postcodes.length === 0) {
-      setError("Please enter one or more valid 5-digit Malaysian postcodes (comma or space separated).");
+    const isCompanyMode = searchMode === "company";
+    const postcodes = isCompanyMode ? [] : parsePostcodes(input);
+    const companies = isCompanyMode ? parseCompanyNames(input) : [];
+    const searchItems = isCompanyMode ? companies : postcodes;
+
+    if (searchItems.length === 0) {
+      setError(
+        isCompanyMode
+          ? "Please enter one or more company names (comma or newline separated)."
+          : "Please enter one or more valid 5-digit Malaysian postcodes (comma or space separated).",
+      );
       return;
     }
     setError("");
@@ -198,45 +215,53 @@ export default function Home() {
       const allPlaces: Place[] = [];
       const skipped: string[] = [];
       const debugMessages: string[] = [];
-      for (let i = 0; i < postcodes.length; i++) {
+      for (let i = 0; i < searchItems.length; i++) {
         if (abort.signal.aborted) break;
-        const pc = postcodes[i];
-        setSearchProgress(`Searching postcode ${i + 1}/${postcodes.length} (${pc})...`);
+        const item = searchItems[i];
+        setSearchProgress(
+          isCompanyMode
+            ? `Looking up company ${i + 1}/${searchItems.length} (${item})...`
+            : `Searching postcode ${i + 1}/${searchItems.length} (${item})...`,
+        );
         try {
+          const body = isCompanyMode
+            ? { mode: "company", company: item }
+            : { mode: "postcode", postcode: item };
           const searchRes = await fetch("/api/search", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ postcode: pc }),
+            body: JSON.stringify(body),
             signal: abort.signal,
           });
           if (searchRes.ok) {
             const data = await searchRes.json();
             const foundPlaces = data.places as Place[];
-            if (data.debug) console.log(`[${pc}] Search debug:`, data.debug);
-            if (data.detail_errors && data.detail_errors.length > 0) console.warn(`[${pc}] Detail API errors:`, data.detail_errors);
-            if (data.sample_details) console.log(`[${pc}] Sample Place Details responses:`, JSON.stringify(data.sample_details, null, 2));
+            if (data.debug) console.log(`[${item}] Search debug:`, data.debug);
             if (foundPlaces.length === 0 && data.debug) {
-              debugMessages.push(`${pc}: ${(data.debug as string[]).join("; ")}`);
+              debugMessages.push(`${item}: ${(data.debug as string[]).join("; ")}`);
             }
-            const tagged = foundPlaces.map((p) => ({ ...p, postcode: pc, enriched: false }));
+            const tag = isCompanyMode ? item : item;
+            const tagged = foundPlaces.map((p) => ({ ...p, postcode: isCompanyMode ? "" : item, enriched: false }));
             allPlaces.push(...tagged);
             setPlaces([...allPlaces]);
           } else {
-            skipped.push(pc);
+            skipped.push(item);
           }
         } catch (err: unknown) {
           if (abort.signal.aborted) break;
-          skipped.push(pc);
+          skipped.push(item);
         }
       }
       setSearchProgress("");
       if (allPlaces.length === 0) {
         throw new Error(
-          `No results found. Try nearby industrial areas.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`,
+          isCompanyMode
+            ? `No results found. Check the company names and try again.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`
+            : `No results found. Try nearby industrial areas.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`,
         );
       }
       if (skipped.length > 0) {
-        setError(`Skipped postcodes (no results or error): ${skipped.join(", ")}`);
+        setError(`Skipped (no results or error): ${skipped.join(", ")}`);
       }
       const seen = new Set<string>();
       const deduped: Place[] = [];
@@ -316,7 +341,7 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "An unexpected error occurred.");
       setStage("error");
     }
-  }, [input, fetchDescriptions]);
+  }, [input, searchMode, fetchDescriptions]);
   const handleExport = useCallback(async () => {
     const rows = places.map((p) => ({
       name: p.name, category: p.category, address: p.address,
@@ -350,6 +375,8 @@ export default function Home() {
   };
   const isRunning = stage === "searching" || stage === "enriching";
   const postcodes = parsePostcodes(input);
+  const companyNames = parseCompanyNames(input);
+  const hasValidInput = searchMode === "company" ? companyNames.length > 0 : postcodes.length > 0;
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
       <header className="bg-[#0f1a2e] text-white shadow-lg">
@@ -415,24 +442,55 @@ export default function Home() {
           </section>
         )}
         <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+          <div className="flex items-center gap-1 mb-4 bg-slate-100 rounded-lg p-1 w-fit">
+            <button
+              onClick={() => { if (!isRunning) { setSearchMode("postcode"); setInput(""); } }}
+              className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${searchMode === "postcode" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+            >
+              By Postcode
+            </button>
+            <button
+              onClick={() => { if (!isRunning) { setSearchMode("company"); setInput(""); } }}
+              className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${searchMode === "company" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+            >
+              By Company Name
+            </button>
+          </div>
           <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-end">
             <div className="flex-1 w-full">
-              <label htmlFor="postcodes" className="block text-sm font-medium text-slate-700 mb-1">
-                Malaysia Postcodes <span className="text-slate-400 font-normal ml-1">(comma or space separated)</span>
+              <label htmlFor="searchInput" className="block text-sm font-medium text-slate-700 mb-1">
+                {searchMode === "company" ? (
+                  <>Company Names <span className="text-slate-400 font-normal ml-1">(comma or newline separated)</span></>
+                ) : (
+                  <>Malaysia Postcodes <span className="text-slate-400 font-normal ml-1">(comma or space separated)</span></>
+                )}
               </label>
-              <input id="postcodes" type="text" placeholder="e.g. 40000, 40100, 81100, 13600"
-                value={input} onChange={(e) => setInput(e.target.value)} disabled={isRunning}
-                className="w-full rounded-lg border border-slate-300 px-4 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:bg-slate-50"
-              />
+              {searchMode === "company" ? (
+                <textarea id="searchInput"
+                  placeholder={"e.g. Top Glove, Hartalega, Press Metal"}
+                  value={input} onChange={(e) => setInput(e.target.value)} disabled={isRunning}
+                  rows={3}
+                  className="w-full rounded-lg border border-slate-300 px-4 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:bg-slate-50 resize-none"
+                />
+              ) : (
+                <input id="searchInput" type="text" placeholder="e.g. 40000, 40100, 81100, 13600"
+                  value={input} onChange={(e) => setInput(e.target.value)} disabled={isRunning}
+                  className="w-full rounded-lg border border-slate-300 px-4 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:bg-slate-50"
+                />
+              )}
               {input && !isRunning && (
-                <p className="mt-1 text-xs text-slate-400">{postcodes.length} valid postcode{postcodes.length !== 1 ? "s" : ""} detected</p>
+                <p className="mt-1 text-xs text-slate-400">
+                  {searchMode === "company"
+                    ? `${companyNames.length} company name${companyNames.length !== 1 ? "s" : ""} detected`
+                    : `${postcodes.length} valid postcode${postcodes.length !== 1 ? "s" : ""} detected`}
+                </p>
               )}
             </div>
-            <button onClick={runPipeline} disabled={isRunning || postcodes.length === 0}
+            <button onClick={runPipeline} disabled={isRunning || !hasValidInput}
               className="rounded-lg bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold px-6 py-2.5 text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 whitespace-nowrap">
               {isRunning ? (
                 <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>Processing...</>
-              ) : "Source Deals"}
+              ) : searchMode === "company" ? "Look Up Companies" : "Source Deals"}
             </button>
             {(stage === "complete" || stage === "error" || places.length > 0) && !isRunning && (
               <button onClick={handleReset} className="rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 font-medium px-4 py-2.5 text-sm transition-colors whitespace-nowrap">Reset</button>
@@ -537,15 +595,26 @@ export default function Home() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
             </div>
-            <h3 className="text-lg font-semibold text-slate-700 mb-1">Enter Malaysia Postcodes</h3>
+            <h3 className="text-lg font-semibold text-slate-700 mb-1">
+              {searchMode === "company" ? "Look Up Companies" : "Enter Malaysia Postcodes"}
+            </h3>
             <p className="text-sm text-slate-500 max-w-md mx-auto">
-              Enter one or more postcodes to search for businesses. Results are enriched with building footprint data and AI-powered business descriptions.
+              {searchMode === "company"
+                ? "Enter company names to look up their details, building footprint, and AI-powered descriptions."
+                : "Enter one or more postcodes to search for businesses. Results are enriched with building footprint data and AI-powered business descriptions."}
             </p>
             <div className="mt-6 flex flex-wrap justify-center gap-2 text-xs text-slate-400">
-              <span className="bg-slate-100 px-2 py-1 rounded">40000 &mdash; Shah Alam</span>
-              <span className="bg-slate-100 px-2 py-1 rounded">81100 &mdash; Johor Bahru</span>
-              <span className="bg-slate-100 px-2 py-1 rounded">13600 &mdash; Perai</span>
-              <span className="bg-slate-100 px-2 py-1 rounded">71000 &mdash; Port Dickson</span>
+              {searchMode === "company" ? (<>
+                <span className="bg-slate-100 px-2 py-1 rounded">Top Glove</span>
+                <span className="bg-slate-100 px-2 py-1 rounded">Hartalega</span>
+                <span className="bg-slate-100 px-2 py-1 rounded">Press Metal</span>
+                <span className="bg-slate-100 px-2 py-1 rounded">Petronas Chemicals</span>
+              </>) : (<>
+                <span className="bg-slate-100 px-2 py-1 rounded">40000 &mdash; Shah Alam</span>
+                <span className="bg-slate-100 px-2 py-1 rounded">81100 &mdash; Johor Bahru</span>
+                <span className="bg-slate-100 px-2 py-1 rounded">13600 &mdash; Perai</span>
+                <span className="bg-slate-100 px-2 py-1 rounded">71000 &mdash; Port Dickson</span>
+              </>)}
             </div>
           </section>
         )}
