@@ -1,21 +1,5 @@
-# Dependencies
-node_modules/
-.next/
-__pycache__/
-*.pyc
-*.pyo
-
-# Local env
-.env
-.env.local
-.env.*.local
-
-# Vercel
-.vercel/
-
-# Claude local config (machine-specific)
-.claude/settings.local.json
-
-# Build outputs
-dist/
-build/
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+/// <reference path="./.next/types/routes.d.ts" />
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.

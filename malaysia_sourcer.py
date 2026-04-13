@@ -1,583 +1,294 @@
-"use client";
-import { useState, useCallback, useRef, useEffect } from "react";
-interface Place {
-  name: string;
-  category: string;
-  address: string;
-  phone: string;
-  website: string;
-  lat: number;
-  lng: number;
-  postcode?: string;
-  sqft?: number | null;
-  size_tier?: string;
-  enriched?: boolean;
-  description?: string;
-}
-interface SavedSearchMeta {
-  id: string;
-  name: string;
-  postcodes: string;
-  date: string;
-  count: number;
-}
-type Stage = "idle" | "searching" | "enriching" | "complete" | "error";
-const BATCH_SIZE = 10;
-const DESCRIBE_BATCH_SIZE = 10;
-const CONCURRENT_DESCRIBE = 2;
-const CONCURRENT_ENRICH = 2;
-function formatSqft(n: number): string {
-  return n.toLocaleString("en-US");
-}
-function parsePostcodes(input: string): string[] {
-  return input
-    .split(/[\s,;]+/)
-    .map((s) => s.trim())
-    .filter((s) => /^\d{5}$/.test(s));
-}
-function tierBadge(tier: string) {
-  const styles: Record<string, string> = {
-    Large: "bg-emerald-100 text-emerald-800 border-emerald-300",
-    Medium: "bg-amber-100 text-amber-800 border-amber-300",
-    Small: "bg-slate-100 text-slate-600 border-slate-300",
-    Unknown: "bg-gray-100 text-gray-500 border-gray-300",
-  };
-  return (
-    <span
-      className={`inline-block px-2 py-0.5 text-xs font-semibold rounded border ${styles[tier] || styles.Unknown}`}
-    >
-      {tier}
-    </span>
-  );
-}
-export default function Home() {
-  const [input, setInput] = useState("");
-  const [stage, setStage] = useState<Stage>("idle");
-  const [places, setPlaces] = useState<Place[]>([]);
-  const [enrichedCount, setEnrichedCount] = useState(0);
-  const [error, setError] = useState("");
-  const [searchProgress, setSearchProgress] = useState("");
-  const abortRef = useRef<AbortController | null>(null);
-  const [savedSearches, setSavedSearches] = useState<SavedSearchMeta[]>([]);
-  const [showSaves, setShowSaves] = useState(false);
-  const [savingState, setSavingState] = useState<"idle" | "saving" | "saved">("idle");
-  const [loadingId, setLoadingId] = useState<string | null>(null);
-  const totalLeads = places.length;
-  const withFootprint = places.filter((p) => p.sqft != null).length;
-  const largeFacilities = places.filter((p) => p.size_tier === "Large").length;
-  const postcodeCount = new Set(places.map((p) => p.postcode).filter(Boolean)).size;
-  useEffect(() => {
-    fetch("/api/saves")
-      .then((r) => r.json())
-      .then((data) => setSavedSearches(data.saves || []))
-      .catch(() => {});
-  }, []);
-  const handleSave = useCallback(async () => {
-    if (places.length === 0) return;
-    setSavingState("saving");
-    try {
-      const postcodesStr = [...new Set(places.map((p) => p.postcode).filter(Boolean))].join(", ");
-      const res = await fetch("/api/saves", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: `Search ${postcodesStr}`,
-          postcodes: postcodesStr,
-          places: places.map((p) => ({
-            name: p.name, category: p.category, address: p.address,
-            phone: p.phone, website: p.website, lat: p.lat, lng: p.lng,
-            postcode: p.postcode || "", sqft: p.sqft ?? null,
-            size_tier: p.size_tier || "", enriched: p.enriched ?? false,
-            description: p.description || "",
-          })),
-        }),
-      });
-      if (res.ok) {
-        setSavingState("saved");
-        const listRes = await fetch("/api/saves");
-        const listData = await listRes.json();
-        setSavedSearches(listData.saves || []);
-        setTimeout(() => setSavingState("idle"), 2000);
-      } else {
-        setSavingState("idle");
-        setError("Failed to save search.");
-      }
-    } catch {
-      setSavingState("idle");
-      setError("Failed to save search.");
-    }
-  }, [places]);
-  const handleLoadSave = useCallback(async (id: string) => {
-    setLoadingId(id);
-    try {
-      const res = await fetch(`/api/saves?id=${id}`);
-      if (!res.ok) throw new Error("Load failed");
-      const data = await res.json();
-      const loaded = (data.places || []) as Place[];
-      setPlaces(loaded.map((p) => ({ ...p, enriched: true })));
-      setInput(data.postcodes || "");
-      setStage("complete");
-      setEnrichedCount(loaded.length);
-      setError("");
-      setShowSaves(false);
-    } catch {
-      setError("Failed to load saved search.");
-    } finally {
-      setLoadingId(null);
-    }
-  }, []);
-  const handleDeleteSave = useCallback(async (id: string) => {
-    try {
-      await fetch(`/api/saves?id=${id}`, { method: "DELETE" });
-      setSavedSearches((prev) => prev.filter((s) => s.id !== id));
-    } catch {
-      setError("Failed to delete saved search.");
-    }
-  }, []);
-  const fetchDescriptions = useCallback(async (allPlaces: Place[], abort: AbortController) => {
-    const jobs: { start: number; batch: Place[] }[] = [];
-    for (let i = 0; i < allPlaces.length; i += DESCRIBE_BATCH_SIZE) {
-      jobs.push({ start: i, batch: allPlaces.slice(i, i + DESCRIBE_BATCH_SIZE) });
-    }
-    let jobIdx = 0;
-    const runNext = async (): Promise<void> => {
-      while (jobIdx < jobs.length) {
-        if (abort.signal.aborted) break;
-        const idx = jobIdx++;
-        const { start, batch } = jobs[idx];
-        try {
-          const res = await fetch("/api/describe", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              businesses: batch.map((p) => ({
-                name: p.name,
-                category: p.category,
-                address: p.address,
-                website: p.website || "",
-              })),
-            }),
-            signal: abort.signal,
-          });
-          if (res.ok) {
-            const data = (await res.json()) as { descriptions: Record<string, string> };
-            if (data.descriptions && Object.keys(data.descriptions).length > 0) {
-              setPlaces((prev) => {
-                const updated = [...prev];
-                for (let i = start; i < Math.min(start + DESCRIBE_BATCH_SIZE, updated.length); i++) {
-                  const name = updated[i].name;
-                  if (data.descriptions[name]) {
-                    updated[i] = { ...updated[i], description: data.descriptions[name] };
-                  }
-                }
-                return updated;
-              });
-            }
-          }
-        } catch {
-          if (abort.signal.aborted) break;
-        }
-      }
-    };
-    const workers = Array.from({ length: Math.min(CONCURRENT_DESCRIBE, jobs.length) }, () => runNext());
-    await Promise.all(workers);
-  }, []);
-  const runPipeline = useCallback(async () => {
-    const postcodes = parsePostcodes(input);
-    if (postcodes.length === 0) {
-      setError("Please enter one or more valid 5-digit Malaysian postcodes (comma or space separated).");
-      return;
-    }
-    setError("");
-    setPlaces([]);
-    setEnrichedCount(0);
-    setStage("searching");
-    const abort = new AbortController();
-    abortRef.current = abort;
-    try {
-      const allPlaces: Place[] = [];
-      const skipped: string[] = [];
-      const debugMessages: string[] = [];
-      for (let i = 0; i < postcodes.length; i++) {
-        if (abort.signal.aborted) break;
-        const pc = postcodes[i];
-        setSearchProgress(`Searching postcode ${i + 1}/${postcodes.length} (${pc})...`);
-        try {
-          const searchRes = await fetch("/api/search", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ postcode: pc }),
-            signal: abort.signal,
-          });
-          if (searchRes.ok) {
-            const data = await searchRes.json();
-            const foundPlaces = data.places as Place[];
-            if (data.debug) console.log(`[${pc}] Search debug:`, data.debug);
-            if (data.detail_errors && data.detail_errors.length > 0) console.warn(`[${pc}] Detail API errors:`, data.detail_errors);
-            if (data.sample_details) console.log(`[${pc}] Sample Place Details responses:`, JSON.stringify(data.sample_details, null, 2));
-            if (foundPlaces.length === 0 && data.debug) {
-              debugMessages.push(`${pc}: ${(data.debug as string[]).join("; ")}`);
-            }
-            const tagged = foundPlaces.map((p) => ({ ...p, postcode: pc, enriched: false }));
-            allPlaces.push(...tagged);
-            setPlaces([...allPlaces]);
-          } else {
-            skipped.push(pc);
-          }
-        } catch (err: unknown) {
-          if (abort.signal.aborted) break;
-          skipped.push(pc);
-        }
-      }
-      setSearchProgress("");
-      if (allPlaces.length === 0) {
-        throw new Error(
-          `No results found. Try nearby industrial areas.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`,
-        );
-      }
-      if (skipped.length > 0) {
-        setError(`Skipped postcodes (no results or error): ${skipped.join(", ")}`);
-      }
-      const seen = new Set<string>();
-      const deduped: Place[] = [];
-      for (const p of allPlaces) {
-        const key = `${p.name.toLowerCase()}|${p.address.toLowerCase()}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          deduped.push(p);
-        }
-      }
-      setPlaces(deduped);
-      setStage("enriching");
-      const enrichPromise = (async () => {
-        const enrichJobs: { start: number; batch: { lat: number; lng: number; name: string }[] }[] = [];
-        for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
-          enrichJobs.push({
-            start: i,
-            batch: deduped.slice(i, i + BATCH_SIZE).map((p) => ({ lat: p.lat, lng: p.lng, name: p.name })),
-          });
-        }
-        let enrichCount = 0;
-        let jobIdx = 0;
-        const runEnrich = async (): Promise<void> => {
-          while (jobIdx < enrichJobs.length) {
-            if (abort.signal.aborted) break;
-            const jIdx = jobIdx++;
-            const { start, batch } = enrichJobs[jIdx];
-            try {
-              const enrichRes = await fetch("/api/enrich", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ places: batch }),
-                signal: abort.signal,
-              });
-              if (enrichRes.ok) {
-                const { results } = (await enrichRes.json()) as {
-                  results: { name: string; sqft: number | null; size_tier: string }[];
-                };
-                setPlaces((prev) => {
-                  const updated = [...prev];
-                  results.forEach((r, idx) => {
-                    const globalIdx = start + idx;
-                    if (globalIdx < updated.length) {
-                      updated[globalIdx] = { ...updated[globalIdx], sqft: r.sqft, size_tier: r.size_tier, enriched: true };
-                    }
-                  });
-                  return updated;
-                });
-                enrichCount += results.length;
-                setEnrichedCount(enrichCount);
-              }
-            } catch {
-              if (abort.signal.aborted) break;
-              setPlaces((prev) => {
-                const updated = [...prev];
-                for (let idx = start; idx < Math.min(start + BATCH_SIZE, updated.length); idx++) {
-                  updated[idx] = { ...updated[idx], enriched: true };
-                }
-                return updated;
-              });
-              enrichCount += batch.length;
-              setEnrichedCount(enrichCount);
-            }
-          }
-        };
-        const workers = Array.from({ length: Math.min(CONCURRENT_ENRICH, enrichJobs.length) }, () => runEnrich());
-        await Promise.all(workers);
-      })();
-      const describePromise = fetchDescriptions(deduped, abort);
-      await Promise.all([enrichPromise, describePromise]);
-      setPlaces((prev) =>
-        prev.map((p) => ({ ...p, description: p.description || "No description available", enriched: true }))
-      );
-      setStage("complete");
-    } catch (err: unknown) {
-      if (abort.signal.aborted) return;
-      setError(err instanceof Error ? err.message : "An unexpected error occurred.");
-      setStage("error");
-    }
-  }, [input, fetchDescriptions]);
-  const handleExport = useCallback(async () => {
-    const rows = places.map((p) => ({
-      name: p.name, category: p.category, address: p.address,
-      phone: p.phone, website: p.website, postcode: p.postcode || "",
-      sqft: p.sqft ?? null, size_tier: p.size_tier || "Unknown", description: p.description || "",
-    }));
-    const res = await fetch("/api/export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows }),
-    });
-    if (!res.ok) { setError("Failed to generate Excel file."); return; }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `PE_Leads_${new Date().toISOString().slice(0, 10)}.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }, [places]);
-  const handleReset = () => {
-    abortRef.current?.abort();
-    setStage("idle");
-    setPlaces([]);
-    setEnrichedCount(0);
-    setError("");
-    setSearchProgress("");
-    setInput("");
-  };
-  const isRunning = stage === "searching" || stage === "enriching";
-  const postcodes = parsePostcodes(input);
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
-      <header className="bg-[#0f1a2e] text-white shadow-lg">
-        <div className="max-w-7xl mx-auto px-6 py-6">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-lg bg-blue-600 flex items-center justify-center font-bold text-lg">PE</div>
-              <div>
-                <h1 className="text-xl font-bold tracking-tight">Malaysia Deal Sourcer</h1>
-                <p className="text-sm text-slate-400">Manufacturing &amp; Industrial Target Identification</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setShowSaves(!showSaves)}
-              className="rounded-lg border border-slate-600 hover:border-slate-400 text-slate-300 hover:text-white font-medium px-4 py-2 text-sm transition-colors flex items-center gap-2"
-            >
-              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
-              </svg>
-              Saved Searches
-              {savedSearches.length > 0 && (
-                <span className="bg-blue-600 text-white text-xs rounded-full px-1.5 py-0.5 min-w-[20px] text-center">{savedSearches.length}</span>
-              )}
-            </button>
-          </div>
-        </div>
-      </header>
-      <main className="max-w-7xl mx-auto px-6 py-8 space-y-6">
-        {showSaves && (
-          <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="font-semibold text-slate-800">Saved Searches</h2>
-              <button onClick={() => setShowSaves(false)} className="text-slate-400 hover:text-slate-600">
-                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            {savedSearches.length === 0 ? (
-              <p className="text-sm text-slate-500 text-center py-6">No saved searches yet. Run a search and click &quot;Save Search&quot; to save it.</p>
-            ) : (
-              <div className="space-y-2">
-                {savedSearches.map((s) => (
-                  <div key={s.id} className="flex items-center justify-between gap-4 p-3 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors">
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-slate-800 truncate">{s.name}</p>
-                      <p className="text-xs text-slate-500">{s.date} &middot; {s.count} leads &middot; {s.postcodes}</p>
-                    </div>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      <button onClick={() => handleLoadSave(s.id)} disabled={loadingId === s.id}
-                        className="rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 transition-colors disabled:opacity-50">
-                        {loadingId === s.id ? "Loading..." : "Load"}
-                      </button>
-                      <button onClick={() => handleDeleteSave(s.id)}
-                        className="rounded-md border border-red-200 text-red-600 hover:bg-red-50 text-xs font-medium px-3 py-1.5 transition-colors">
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
-        <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-          <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-end">
-            <div className="flex-1 w-full">
-              <label htmlFor="postcodes" className="block text-sm font-medium text-slate-700 mb-1">
-                Malaysia Postcodes <span className="text-slate-400 font-normal ml-1">(comma or space separated)</span>
-              </label>
-              <input id="postcodes" type="text" placeholder="e.g. 40000, 40100, 81100, 13600"
-                value={input} onChange={(e) => setInput(e.target.value)} disabled={isRunning}
-                className="w-full rounded-lg border border-slate-300 px-4 py-2.5 text-base focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:bg-slate-50"
-              />
-              {input && !isRunning && (
-                <p className="mt-1 text-xs text-slate-400">{postcodes.length} valid postcode{postcodes.length !== 1 ? "s" : ""} detected</p>
-              )}
-            </div>
-            <button onClick={runPipeline} disabled={isRunning || postcodes.length === 0}
-              className="rounded-lg bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold px-6 py-2.5 text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 whitespace-nowrap">
-              {isRunning ? (
-                <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>Processing...</>
-              ) : "Source Deals"}
-            </button>
-            {(stage === "complete" || stage === "error" || places.length > 0) && !isRunning && (
-              <button onClick={handleReset} className="rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 font-medium px-4 py-2.5 text-sm transition-colors whitespace-nowrap">Reset</button>
-            )}
-          </div>
-          {searchProgress && <div className="mt-3 text-sm text-blue-600 font-medium">{searchProgress}</div>}
-          {error && <div className="mt-4 bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">{error}</div>}
-        </section>
-        {stage !== "idle" && (
-          <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-            <div className="flex items-center gap-2 sm:gap-8 overflow-x-auto">
-              <StepIndicator label="Geocoding" status={stage === "searching" ? "active" : "done"} />
-              <StepConnector />
-              <StepIndicator label={`Searching Places${totalLeads > 0 ? ` (${totalLeads})` : ""}`} status={stage === "searching" ? "active" : totalLeads > 0 ? "done" : "pending"} />
-              <StepConnector />
-              <StepIndicator label={`Enriching${enrichedCount > 0 ? ` (${enrichedCount}/${totalLeads})` : ""}`} status={stage === "enriching" ? "active" : stage === "complete" ? "done" : "pending"} />
-              <StepConnector />
-              <StepIndicator label="Complete" status={stage === "complete" ? "done" : "pending"} />
-            </div>
-          </section>
-        )}
-        {places.length > 0 && (
-          <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <StatCard label="Total Leads" value={totalLeads.toString()} />
-            <StatCard label="Large Facilities" value={largeFacilities.toString()} accent="emerald" />
-            <StatCard label="With Footprint" value={`${withFootprint} / ${totalLeads}`} />
-            <StatCard label="Postcodes Searched" value={postcodeCount.toString()} accent="blue" />
-          </section>
-        )}
-        {places.length > 0 && (
-          <section className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
-              <h2 className="font-semibold text-slate-800">Sourced Leads ({places.length})</h2>
-              <div className="flex items-center gap-2">
-                <button onClick={handleSave} disabled={savingState !== "idle"}
-                  className={`rounded-lg font-semibold px-5 py-2 text-sm transition-colors flex items-center gap-2 ${savingState === "saved" ? "bg-emerald-100 text-emerald-700 border border-emerald-300" : "border border-slate-300 text-slate-700 hover:bg-slate-50"} disabled:opacity-50`}>
-                  {savingState === "saving" ? (
-                    <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>Saving...</>
-                  ) : savingState === "saved" ? (
-                    <><svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>Saved!</>
-                  ) : (
-                    <><svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" /></svg>Save Search</>
-                  )}
-                </button>
-                <button onClick={handleExport}
-                  className="rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-5 py-2 text-sm transition-colors flex items-center gap-2">
-                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                  Export to Excel
-                </button>
-              </div>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200">
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600 w-8">#</th>
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600">Postcode</th>
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600 min-w-[180px]">Company Name</th>
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600 min-w-[200px]">Business Description</th>
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600 min-w-[200px]">Address</th>
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600">Phone</th>
-                    <th className="text-left px-4 py-3 font-semibold text-slate-600">Website</th>
-                    <th className="text-right px-4 py-3 font-semibold text-slate-600">Est. Sq Ft</th>
-                    <th className="text-center px-4 py-3 font-semibold text-slate-600">Size Tier</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {places.map((p, idx) => (
-                    <tr key={idx} className={`border-b border-slate-100 hover:bg-blue-50/50 transition-colors ${idx % 2 === 1 ? "bg-slate-50/50" : ""}`}>
-                      <td className="px-4 py-3 text-slate-400">{idx + 1}</td>
-                      <td className="px-4 py-3 text-slate-500 font-mono text-xs">{p.postcode || "--"}</td>
-                      <td className="px-4 py-3 font-medium text-slate-800">{p.name}</td>
-                      <td className="px-4 py-3 text-slate-600 text-xs">
-                        {p.description ? p.description : <span className="skeleton inline-block w-32 h-4" />}
-                      </td>
-                      <td className="px-4 py-3 text-slate-600 text-xs">{p.address || "--"}</td>
-                      <td className="px-4 py-3 text-slate-600 whitespace-nowrap">{p.phone || "--"}</td>
-                      <td className="px-4 py-3">
-                        {p.website ? (
-                          <a href={p.website} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline text-xs truncate block max-w-[160px]">
-                            {p.website.replace(/^https?:\/\/(www\.)?/, "").slice(0, 30)}
-                          </a>
-                        ) : <span className="text-slate-400">--</span>}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {!p.enriched ? <span className="skeleton inline-block w-16 h-4" /> : p.sqft != null ? formatSqft(p.sqft) : <span className="text-slate-400">N/A</span>}
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        {!p.enriched ? <span className="skeleton inline-block w-14 h-4" /> : tierBadge(p.size_tier || "Unknown")}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        )}
-        {stage === "idle" && (
-          <section className="bg-white rounded-xl shadow-sm border border-slate-200 p-12 text-center">
-            <div className="mx-auto w-16 h-16 rounded-full bg-slate-100 flex items-center justify-center mb-4">
-              <svg className="h-8 w-8 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-              </svg>
-            </div>
-            <h3 className="text-lg font-semibold text-slate-700 mb-1">Enter Malaysia Postcodes</h3>
-            <p className="text-sm text-slate-500 max-w-md mx-auto">
-              Enter one or more postcodes to search for businesses. Results are enriched with building footprint data and AI-powered business descriptions.
-            </p>
-            <div className="mt-6 flex flex-wrap justify-center gap-2 text-xs text-slate-400">
-              <span className="bg-slate-100 px-2 py-1 rounded">40000 &mdash; Shah Alam</span>
-              <span className="bg-slate-100 px-2 py-1 rounded">81100 &mdash; Johor Bahru</span>
-              <span className="bg-slate-100 px-2 py-1 rounded">13600 &mdash; Perai</span>
-              <span className="bg-slate-100 px-2 py-1 rounded">71000 &mdash; Port Dickson</span>
-            </div>
-          </section>
-        )}
-      </main>
-      <footer className="mt-12 border-t border-slate-200 bg-white">
-        <div className="max-w-7xl mx-auto px-6 py-4 text-xs text-slate-400 flex justify-between">
-          <span>Malaysia PE Deal Sourcer</span>
-          <span>Data: Google Places API + OpenStreetMap + Claude AI</span>
-        </div>
-      </footer>
-    </div>
-  );
-}
-function StepIndicator({ label, status }: { label: string; status: "pending" | "active" | "done" }) {
-  const dotClass = status === "done" ? "bg-emerald-500" : status === "active" ? "bg-blue-500 animate-pulse-slow" : "bg-slate-300";
-  const textClass = status === "done" ? "text-emerald-700 font-medium" : status === "active" ? "text-blue-700 font-medium" : "text-slate-400";
-  return (
-    <div className="flex items-center gap-2 whitespace-nowrap">
-      <div className={`h-3 w-3 rounded-full ${dotClass}`} />
-      <span className={`text-sm ${textClass}`}>{label}</span>
-    </div>
-  );
-}
-function StepConnector() {
-  return <div className="hidden sm:block h-px w-8 bg-slate-300 flex-shrink-0" />;
-}
-function StatCard({ label, value, accent }: { label: string; value: string; accent?: string }) {
-  const borderColor = accent === "emerald" ? "border-l-emerald-500" : accent === "blue" ? "border-l-blue-500" : "border-l-slate-300";
-  return (
-    <div className={`bg-white rounded-xl shadow-sm border border-slate-200 border-l-4 ${borderColor} p-4`}>
-      <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">{label}</p>
-      <p className="mt-1 text-2xl font-bold text-slate-800">{value}</p>
-    </div>
-  );
-}
+#!/usr/bin/env python3
+"""
+Malaysia Manufacturing Deal Sourcer
+====================================
+CLI tool for identifying manufacturing/factory targets in Malaysia by postcode.
+Uses Google Places API for discovery, OpenStreetMap (Overpass) for building
+footprint estimation, and homepage keyword scraping.
+
+Usage:
+    python malaysia_sourcer.py --postcodes 40000 40100 40150
+    python malaysia_sourcer.py --postcodes 40000 40100 --api-key YOUR_KEY
+    python malaysia_sourcer.py --file postcodes.txt
+"""
+from __future__ import annotations
+import argparse
+import math
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import googlemaps
+import openpyxl
+import overpy
+import requests
+from bs4 import BeautifulSoup
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+SEARCH_KEYWORDS: list[str] = [
+    "factory", "manufacturing", "industrial estate",
+    "kilang", "manufacturer", "industrial park",
+]
+SQ_M_TO_SQ_FT = 10.7639
+PLACES_DELAY = 0.25
+DETAILS_DELAY = 0.15
+OVERPASS_DELAY = 1.0
+WEB_SCRAPE_TIMEOUT = 6
+WEB_SCRAPE_DELAY = 0.3
+HOMEPAGE_KEYWORDS = [
+    "employees", "annual capacity", "production capacity",
+    "workforce", "headcount", "staff", "revenue",
+    "square feet", "square meters", "sq ft", "sq m",
+    "ISO 9001", "ISO 14001", "IATF",
+]
+OVERPASS_RADIUS_M = 80
+TIER_SMALL_MAX = 15_000
+TIER_MEDIUM_MAX = 50_000
+
+
+def postcode_to_latlng(gmaps: googlemaps.Client, postcode: str) -> tuple[float, float] | None:
+    try:
+        results = gmaps.geocode(f"{postcode}, Malaysia")
+        if results:
+            loc = results[0]["geometry"]["location"]
+            return loc["lat"], loc["lng"]
+    except Exception as exc:
+        print(f"  [WARN] Geocode failed for {postcode}: {exc}")
+    return None
+
+
+def search_places_for_postcode(gmaps, postcode, lat, lng) -> list[dict[str, Any]]:
+    seen_ids: set[str] = set()
+    results: list[dict[str, Any]] = []
+    for keyword in SEARCH_KEYWORDS:
+        query = f"{keyword} {postcode} Malaysia"
+        try:
+            resp = gmaps.places(query=query, location=(lat, lng), radius=5000)
+        except Exception as exc:
+            print(f"  [WARN] Places search error ({keyword}): {exc}")
+            time.sleep(PLACES_DELAY)
+            continue
+        for place in resp.get("results", []):
+            pid = place["place_id"]
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                results.append(place)
+        while resp.get("next_page_token"):
+            time.sleep(2)
+            try:
+                resp = gmaps.places(query=query, page_token=resp["next_page_token"])
+                for place in resp.get("results", []):
+                    pid = place["place_id"]
+                    if pid not in seen_ids:
+                        seen_ids.add(pid)
+                        results.append(place)
+            except Exception:
+                break
+        time.sleep(PLACES_DELAY)
+    return results
+
+
+def enrich_place(gmaps, place_id: str) -> dict[str, Any]:
+    fields = ["name", "formatted_address", "formatted_phone_number", "website", "geometry", "types", "business_status", "url"]
+    try:
+        detail = gmaps.place(place_id=place_id, fields=fields)
+        return detail.get("result", {})
+    except Exception as exc:
+        print(f"  [WARN] Details fetch failed for {place_id}: {exc}")
+        return {}
+
+
+def _polygon_area_sq_m(coords: list[tuple[float, float]]) -> float:
+    n = len(coords)
+    if n < 3:
+        return 0.0
+    ref_lat, ref_lng = coords[0]
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lng = 111_320.0 * math.cos(math.radians(ref_lat))
+    pts = [((lat - ref_lat) * m_per_deg_lat, (lng - ref_lng) * m_per_deg_lng) for lat, lng in coords]
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += pts[i][0] * pts[j][1]
+        area -= pts[j][0] * pts[i][1]
+    return abs(area) / 2.0
+
+
+def estimate_building_sqft(lat: float, lng: float) -> float | None:
+    api = overpy.Overpass()
+    query = f"""
+    [out:json][timeout:10];
+    (way["building"](around:{OVERPASS_RADIUS_M},{lat},{lng}););
+    out body;>;out skel qt;
+    """
+    try:
+        result = api.query(query)
+    except Exception as exc:
+        print(f"    [WARN] Overpass query failed: {exc}")
+        return None
+    if not result.ways:
+        return None
+    best_area = 0.0
+    for way in result.ways:
+        nodes = way.get_nodes(resolve_missing=False)
+        coords = [(float(n.lat), float(n.lon)) for n in nodes if n.lat is not None]
+        if len(coords) < 3:
+            continue
+        area = _polygon_area_sq_m(coords)
+        if area > best_area:
+            best_area = area
+    return best_area * SQ_M_TO_SQ_FT if best_area > 0 else None
+
+
+def scrape_homepage_keywords(url: str) -> list[str]:
+    if not url:
+        return []
+    try:
+        resp = requests.get(url, timeout=WEB_SCRAPE_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; DealSourcerBot/1.0)"})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        text = soup.get_text(separator=" ", strip=True).lower()
+        return [kw for kw in HOMEPAGE_KEYWORDS if kw.lower() in text]
+    except Exception:
+        return []
+
+
+def classify_size_tier(sqft: float | None) -> str:
+    if sqft is None: return "Unknown"
+    if sqft <= TIER_SMALL_MAX: return "Small"
+    if sqft <= TIER_MEDIUM_MAX: return "Medium"
+    return "Large"
+
+
+COLUMNS = [
+    ("No.", 6), ("Company Name", 38), ("Category / Types", 28),
+    ("Full Address", 48), ("Phone", 20), ("Website", 34),
+    ("Sq Ft Estimate", 16), ("Size Tier", 13), ("Homepage Keywords", 32), ("Google Maps Link", 42),
+]
+
+
+def write_excel(rows: list[dict[str, Any]], output_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Manufacturing Leads"
+    header_font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
+    wrap = Alignment(wrap_text=True, vertical="top")
+    for col_idx, (col_name, width) in enumerate(COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    alt_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+    for row_idx, row_data in enumerate(rows, start=2):
+        values = [row_idx - 1, row_data.get("name", ""), row_data.get("category", ""), row_data.get("address", ""),
+                  row_data.get("phone", ""), row_data.get("website", ""), row_data.get("sqft"),
+                  row_data.get("size_tier", ""), row_data.get("homepage_keywords", ""), row_data.get("maps_link", "")]
+        for col_idx, val in enumerate(values, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = thin_border
+            cell.alignment = wrap
+            if row_idx % 2 == 0:
+                cell.fill = alt_fill
+            if col_idx == 7 and isinstance(val, (int, float)):
+                cell.number_format = '#,##0'
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}{len(rows) + 1}"
+    wb.save(output_path)
+
+
+def run(postcodes: list[str], api_key: str) -> None:
+    gmaps = googlemaps.Client(key=api_key)
+    all_leads: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for pc_idx, postcode in enumerate(postcodes, start=1):
+        postcode = postcode.strip()
+        if not re.fullmatch(r"\d{5}", postcode):
+            print(f"[SKIP] Invalid postcode: '{postcode}'")
+            continue
+        print(f"\n[{pc_idx}/{len(postcodes)}] Processing: {postcode}")
+        latlng = postcode_to_latlng(gmaps, postcode)
+        if not latlng:
+            continue
+        lat, lng = latlng
+        places = search_places_for_postcode(gmaps, postcode, lat, lng)
+        print(f"  Found {len(places)} unique places")
+        for i, place in enumerate(places):
+            pid = place["place_id"]
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            print(f"  [{i+1}/{len(places)}] Enriching: {place.get('name', 'Unknown')}")
+            detail = enrich_place(gmaps, pid)
+            time.sleep(DETAILS_DELAY)
+            if not detail:
+                continue
+            geom = detail.get("geometry", place.get("geometry", {}))
+            plat = geom.get("location", {}).get("lat", lat)
+            plng = geom.get("location", {}).get("lng", lng)
+            sqft = estimate_building_sqft(plat, plng)
+            time.sleep(OVERPASS_DELAY)
+            website = detail.get("website", "")
+            kw_found = scrape_homepage_keywords(website) if website else []
+            if website:
+                time.sleep(WEB_SCRAPE_DELAY)
+            types_list = detail.get("types", place.get("types", []))
+            all_leads.append({
+                "name": detail.get("name", place.get("name", "")),
+                "category": ", ".join(t.replace("_", " ").title() for t in types_list if t != "establishment"),
+                "address": detail.get("formatted_address", ""),
+                "phone": detail.get("formatted_phone_number", ""),
+                "website": website,
+                "sqft": round(sqft) if sqft else None,
+                "size_tier": classify_size_tier(sqft),
+                "homepage_keywords": ", ".join(kw_found),
+                "maps_link": detail.get("url", ""),
+            })
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for lead in all_leads:
+        key = (lead["name"].lower().strip(), lead["address"].lower().strip())
+        if key not in seen_keys:
+            seen_keys.add(key)
+            deduped.append(lead)
+    deduped.sort(key=lambda r: (r["sqft"] is None, -(r["sqft"] or 0), r["name"]))
+    if not deduped:
+        print("\nNo leads found.")
+        return
+    output_path = Path.cwd() / f"Source_Leads_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    write_excel(deduped, output_path)
+    print(f"\nComplete: {len(deduped)} leads → {output_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Malaysia Manufacturing Deal Sourcer")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--postcodes", "-p", nargs="+")
+    group.add_argument("--file", "-f", type=str)
+    parser.add_argument("--api-key", "-k", type=str, default=None)
+    args = parser.parse_args()
+    api_key = args.api_key or os.environ.get("GOOGLE_MAPS_API_KEY", "")
+    if not api_key:
+        print("ERROR: Provide a Google Maps API key via --api-key or GOOGLE_MAPS_API_KEY env var.")
+        sys.exit(1)
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            print(f"ERROR: File not found: {path}")
+            sys.exit(1)
+        postcodes = [l.strip() for l in path.read_text().splitlines() if l.strip() and not l.strip().startswith("#")]
+    else:
+        postcodes = args.postcodes
+    run(postcodes, api_key)
+
+
+if __name__ == "__main__":
+    main()
