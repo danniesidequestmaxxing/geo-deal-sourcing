@@ -159,9 +159,9 @@ async def enrich(body: EnrichRequest) -> JSONResponse:
         for place in batch:
             cache_hit, sqft, source = _read_cache(r, place.lat, place.lng)
 
-            # Re-run the fallback chain for stale "none" cache entries
-            # (from before the category-based fallback was added).
-            if cache_hit and source == "none" and sqft is None:
+            # Re-run the fallback chain for any stale cache entries that
+            # stored a None sqft (from before the category fallback existed).
+            if cache_hit and sqft is None:
                 cache_hit = False
 
             if not cache_hit:
