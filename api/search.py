@@ -86,6 +86,19 @@ _DETAIL_FIELDS: list[str] = [
 ]
 
 
+def _extract_postcode(address: str) -> str:
+    """Extract a 5-digit Malaysian postcode from a formatted address.
+
+    Args:
+        address: A Google Places formatted address string.
+
+    Returns:
+        The extracted postcode, or an empty string if none found.
+    """
+    match = re.search(r"\b(\d{5})\b", address)
+    return match.group(1) if match else ""
+
+
 def _enrich_place(
     gmaps: googlemaps.Client,
     place: dict[str, Any],
@@ -128,10 +141,11 @@ def _enrich_place(
         or detail.get("international_phone_number", "")
     )
 
+    address = detail.get("formatted_address", place.get("formatted_address", ""))
     return {
         "name": detail.get("name", place.get("name", "")),
         "category": types_str,
-        "address": detail.get("formatted_address", place.get("formatted_address", "")),
+        "address": address,
         "phone": phone,
         "website": detail.get("website", ""),
         "lat": geom.get("location", {}).get("lat", fallback_lat),
@@ -139,6 +153,7 @@ def _enrich_place(
         "place_id": place.get("place_id", ""),
         "business_status": detail.get("business_status", ""),
         "viewport": geom.get("viewport", {}),
+        "postcode": _extract_postcode(address),
     }
 
 

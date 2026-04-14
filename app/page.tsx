@@ -317,8 +317,7 @@ export default function Home() {
             if (foundPlaces.length === 0 && data.debug) {
               debugMessages.push(`${item}: ${(data.debug as string[]).join("; ")}`);
             }
-            const tag = isCompanyMode ? item : item;
-            const tagged = foundPlaces.map((p) => ({ ...p, postcode: isCompanyMode ? "" : item, enriched: false }));
+            const tagged = foundPlaces.map((p) => ({ ...p, postcode: p.postcode || (isCompanyMode ? "" : item), enriched: false }));
             allPlaces.push(...tagged);
             setPlaces([...allPlaces]);
           } else {
