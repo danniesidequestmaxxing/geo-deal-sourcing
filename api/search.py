@@ -1,23 +1,34 @@
-"""
-POST /api/search
-Two modes:
-  1. Postcode mode — geocode a Malaysian postcode, search Google Places for
-     businesses, and enrich each result with Place Details.
-  2. Company mode — search for a specific company name in Malaysia and return
-     its enriched details.
+"""POST /api/search — Google Places discovery endpoint.
+
+Supports two modes:
+
+1. **Postcode mode** — geocode a Malaysian postcode, search Google Places for
+   businesses within 5 km, and enrich each result with Place Details.
+2. **Company mode** — search for a specific company name in Malaysia and return
+   its enriched details.
 """
 from __future__ import annotations
-import os
+
+import logging
 import re
 import time
 from typing import Any
+
 import googlemaps
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from api._shared.constants import DETAILS_DELAY, PLACES_DELAY
+from api._shared.google_maps import get_gmaps_client
+
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
+# ---------------------------------------------------------------------------
+# Search keywords (broader set for the web UI vs. the CLI tool)
+# ---------------------------------------------------------------------------
 SEARCH_KEYWORDS: list[str] = [
     "company",
     "sdn bhd",
@@ -30,37 +41,80 @@ SEARCH_KEYWORDS: list[str] = [
     "logistics",
     "engineering",
 ]
-PLACES_DELAY = 0.05
-DETAILS_DELAY = 0.05
+
+# Names too generic / meaningless to surface as leads
+_JUNK_NAMES: frozenset[str] = frozenset({
+    "sdn bhd", "sdn. bhd.", "sdn bhd.", "bhd", "bhd.", "malaysia",
+    "(malaysia)", "",
+})
+
+_JUNK_SUFFIXES: list[str] = [
+    "sdn bhd", "sdn. bhd.", "sdn bhd.", "bhd", "bhd.",
+    "(m)", "(malaysia)", "malaysia",
+]
 
 
+# ---------------------------------------------------------------------------
+# Request model
+# ---------------------------------------------------------------------------
 class SearchRequest(BaseModel):
+    """Incoming search request body.
+
+    Attributes:
+        postcode: A 5-digit Malaysian postcode (postcode mode).
+        mode: Either ``"postcode"`` or ``"company"``.
+        company: Company name to look up (company mode).
+    """
+
     postcode: str = ""
-    mode: str = "postcode"       # "postcode" | "company"
+    mode: str = "postcode"
     company: str = ""
 
 
-def _get_gmaps() -> googlemaps.Client:
-    api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not configured on the server.")
-    return googlemaps.Client(key=api_key)
+# ---------------------------------------------------------------------------
+# Place enrichment
+# ---------------------------------------------------------------------------
+_DETAIL_FIELDS: list[str] = [
+    "name",
+    "formatted_address",
+    "formatted_phone_number",
+    "international_phone_number",
+    "website",
+    "geometry",
+    "type",
+    "business_status",
+]
 
 
-def _enrich_place(gmaps: googlemaps.Client, place: dict[str, Any], fallback_lat: float, fallback_lng: float) -> dict[str, Any] | None:
-    """Fetch Place Details and return a normalised dict."""
+def _enrich_place(
+    gmaps: googlemaps.Client,
+    place: dict[str, Any],
+    fallback_lat: float,
+    fallback_lng: float,
+) -> dict[str, Any] | None:
+    """Fetch Place Details and return a normalised dict.
+
+    Args:
+        gmaps: Authenticated Google Maps client.
+        place: Raw place result from a text-search response.
+        fallback_lat: Default latitude when the detail response has none.
+        fallback_lng: Default longitude when the detail response has none.
+
+    Returns:
+        A flat dict with keys ``name``, ``category``, ``address``, ``phone``,
+        ``website``, ``lat``, ``lng``, or ``None`` if enrichment failed.
+    """
     detail: dict[str, Any] = {}
     try:
         detail_resp = gmaps.place(
             place_id=place["place_id"],
-            fields=[
-                "name", "formatted_address", "formatted_phone_number",
-                "international_phone_number", "website", "geometry", "type",
-            ],
+            fields=_DETAIL_FIELDS,
         )
         detail = detail_resp.get("result", {})
-    except Exception:
-        pass
+    except googlemaps.exceptions.ApiError as exc:
+        logger.warning("Place Details API error for %s: %s", place["place_id"], exc)
+    except Exception as exc:
+        logger.warning("Unexpected error enriching place %s: %s", place["place_id"], exc)
 
     geom = detail.get("geometry", place.get("geometry", {}))
     types_list = detail.get("types", detail.get("type", place.get("types", [])))
@@ -69,7 +123,11 @@ def _enrich_place(gmaps: googlemaps.Client, place: dict[str, Any], fallback_lat:
         for t in types_list
         if t not in ("establishment", "point_of_interest")
     )
-    phone = detail.get("formatted_phone_number", "") or detail.get("international_phone_number", "")
+    phone = (
+        detail.get("formatted_phone_number", "")
+        or detail.get("international_phone_number", "")
+    )
+
     return {
         "name": detail.get("name", place.get("name", "")),
         "category": types_str,
@@ -78,39 +136,73 @@ def _enrich_place(gmaps: googlemaps.Client, place: dict[str, Any], fallback_lat:
         "website": detail.get("website", ""),
         "lat": geom.get("location", {}).get("lat", fallback_lat),
         "lng": geom.get("location", {}).get("lng", fallback_lng),
+        "place_id": place.get("place_id", ""),
+        "business_status": detail.get("business_status", ""),
+        "viewport": geom.get("viewport", {}),
     }
 
 
-JUNK_NAMES = {"sdn bhd", "sdn. bhd.", "sdn bhd.", "bhd", "bhd.", "malaysia", "(malaysia)", ""}
-
-
+# ---------------------------------------------------------------------------
+# Junk filtering
+# ---------------------------------------------------------------------------
 def _filter_junk(enriched: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove results with meaningless or overly-generic business names.
+
+    Args:
+        enriched: List of enriched place dicts.
+
+    Returns:
+        Filtered list with junk entries removed.
+    """
     filtered: list[dict[str, Any]] = []
-    for e in enriched:
-        name = e["name"].strip()
+    for entry in enriched:
+        name = entry["name"].strip()
         if len(name) < 3:
             continue
         core = name.lower().strip("() .")
-        for suffix in ["sdn bhd", "sdn. bhd.", "sdn bhd.", "bhd", "bhd.", "(m)", "(malaysia)", "malaysia"]:
+        for suffix in _JUNK_SUFFIXES:
             core = core.replace(suffix, "").strip(" .,()-")
-        if not core or core in JUNK_NAMES:
+        if not core or core in _JUNK_NAMES:
             continue
-        filtered.append(e)
+        filtered.append(entry)
     return filtered
 
 
-# ---- Postcode-based search ------------------------------------------------
+# ---------------------------------------------------------------------------
+# Postcode-based search
+# ---------------------------------------------------------------------------
+def _search_by_postcode(
+    gmaps: googlemaps.Client,
+    postcode: str,
+) -> JSONResponse:
+    """Search for businesses near a Malaysian postcode.
 
-def _search_by_postcode(gmaps: googlemaps.Client, postcode: str) -> JSONResponse:
+    Args:
+        gmaps: Authenticated Google Maps client.
+        postcode: A 5-digit Malaysian postcode.
+
+    Returns:
+        JSON response with ``places``, ``count``, ``postcode``, ``centroid``,
+        and ``debug`` fields.
+
+    Raises:
+        HTTPException: On invalid postcode or geocoding failure.
+    """
     if not re.fullmatch(r"\d{5}", postcode):
-        raise HTTPException(status_code=400, detail="Invalid postcode. Must be exactly 5 digits.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid postcode. Must be exactly 5 digits.",
+        )
 
     try:
         geo_results = gmaps.geocode(f"{postcode}, Malaysia")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Geocoding failed: {exc}")
     if not geo_results:
-        raise HTTPException(status_code=404, detail=f"Could not geocode postcode {postcode}.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not geocode postcode {postcode}.",
+        )
 
     loc = geo_results[0]["geometry"]["location"]
     lat, lng = loc["lat"], loc["lng"]
@@ -123,11 +215,15 @@ def _search_by_postcode(gmaps: googlemaps.Client, postcode: str) -> JSONResponse
         query = f"{keyword} {postcode} Malaysia"
         try:
             resp = gmaps.places(query=query, location=(lat, lng), radius=5000)
-            debug_log.append(f"{keyword}: status={resp.get('status','?')}, results={len(resp.get('results', []))}")
+            debug_log.append(
+                f"{keyword}: status={resp.get('status', '?')}, "
+                f"results={len(resp.get('results', []))}"
+            )
         except Exception as exc:
             debug_log.append(f"{keyword}: EXCEPTION={exc}")
             time.sleep(PLACES_DELAY)
             continue
+
         for place in resp.get("results", []):
             pid = place["place_id"]
             if pid not in seen_ids:
@@ -136,14 +232,20 @@ def _search_by_postcode(gmaps: googlemaps.Client, postcode: str) -> JSONResponse
         time.sleep(PLACES_DELAY)
 
     if not raw_places:
-        return JSONResponse(content={"places": [], "count": 0, "postcode": postcode,
-                                      "centroid": {"lat": lat, "lng": lng}, "debug": debug_log})
+        return JSONResponse(content={
+            "places": [],
+            "count": 0,
+            "postcode": postcode,
+            "centroid": {"lat": lat, "lng": lng},
+            "debug": debug_log,
+        })
 
-    enriched: list[dict[str, Any]] = []
-    for place in raw_places:
-        row = _enrich_place(gmaps, place, lat, lng)
-        if row:
-            enriched.append(row)
+    enriched = [
+        row
+        for place in raw_places
+        if (row := _enrich_place(gmaps, place, lat, lng)) is not None
+    ]
+    for _ in enriched:
         time.sleep(DETAILS_DELAY)
 
     enriched = _filter_junk(enriched)
@@ -157,9 +259,25 @@ def _search_by_postcode(gmaps: googlemaps.Client, postcode: str) -> JSONResponse
     })
 
 
-# ---- Company name search --------------------------------------------------
+# ---------------------------------------------------------------------------
+# Company-name search
+# ---------------------------------------------------------------------------
+def _search_by_company(
+    gmaps: googlemaps.Client,
+    company: str,
+) -> JSONResponse:
+    """Look up a specific company name via Google Places.
 
-def _search_by_company(gmaps: googlemaps.Client, company: str) -> JSONResponse:
+    Args:
+        gmaps: Authenticated Google Maps client.
+        company: Company name to search for.
+
+    Returns:
+        JSON response with ``places``, ``count``, ``company``, and ``debug``.
+
+    Raises:
+        HTTPException: If the company name is too short or the API call fails.
+    """
     company = company.strip()
     if len(company) < 2:
         raise HTTPException(status_code=400, detail="Company name too short.")
@@ -169,16 +287,26 @@ def _search_by_company(gmaps: googlemaps.Client, company: str) -> JSONResponse:
 
     try:
         resp = gmaps.places(query=query)
-        debug_log.append(f"query='{query}': status={resp.get('status','?')}, results={len(resp.get('results', []))}")
+        debug_log.append(
+            f"query='{query}': status={resp.get('status', '?')}, "
+            f"results={len(resp.get('results', []))}"
+        )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Places search failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail=f"Places search failed: {exc}"
+        )
 
     raw_places = resp.get("results", [])
     if not raw_places:
-        return JSONResponse(content={"places": [], "count": 0, "company": company, "debug": debug_log})
+        return JSONResponse(content={
+            "places": [],
+            "count": 0,
+            "company": company,
+            "debug": debug_log,
+        })
 
-    enriched: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    enriched: list[dict[str, Any]] = []
     for place in raw_places:
         pid = place["place_id"]
         if pid in seen_ids:
@@ -197,13 +325,21 @@ def _search_by_company(gmaps: googlemaps.Client, company: str) -> JSONResponse:
     })
 
 
-# ---- Main endpoint --------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
 @app.post("/api/search")
-async def search(body: SearchRequest):
-    gmaps = _get_gmaps()
+async def search(body: SearchRequest) -> JSONResponse:
+    """Route the search request to the appropriate handler.
+
+    Args:
+        body: Parsed request containing the search mode and parameters.
+
+    Returns:
+        A JSON response with enriched place results.
+    """
+    gmaps = get_gmaps_client()
 
     if body.mode == "company":
         return _search_by_company(gmaps, body.company)
-    else:
-        return _search_by_postcode(gmaps, body.postcode)
+    return _search_by_postcode(gmaps, body.postcode)
