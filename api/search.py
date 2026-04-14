@@ -82,6 +82,7 @@ _DETAIL_FIELDS: list[str] = [
     "website",
     "geometry",
     "type",
+    "business_status",
 ]
 
 
@@ -135,6 +136,9 @@ def _enrich_place(
         "website": detail.get("website", ""),
         "lat": geom.get("location", {}).get("lat", fallback_lat),
         "lng": geom.get("location", {}).get("lng", fallback_lng),
+        "place_id": place.get("place_id", ""),
+        "business_status": detail.get("business_status", ""),
+        "viewport": geom.get("viewport", {}),
     }
 
 

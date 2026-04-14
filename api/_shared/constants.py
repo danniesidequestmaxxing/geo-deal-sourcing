@@ -14,6 +14,7 @@ SQ_M_TO_SQ_FT: float = 10.7639
 # Overpass API (OpenStreetMap building footprints)
 # ---------------------------------------------------------------------------
 OVERPASS_RADIUS_M: int = 80
+OVERPASS_RADIUS_WIDE: int = 200
 
 OVERPASS_SERVERS: list[str] = [
     "https://overpass-api.de/api/interpreter",
@@ -35,6 +36,12 @@ TIER_MEDIUM_MAX: int = 100_000
 # Revenue estimation
 # ---------------------------------------------------------------------------
 REVENUE_PER_SQFT: int = 150
+
+# ---------------------------------------------------------------------------
+# Viewport-based estimation
+# ---------------------------------------------------------------------------
+VIEWPORT_BUILDING_RATIO: float = 0.35
+MAX_VIEWPORT_SQFT: int = 2_000_000
 
 # ---------------------------------------------------------------------------
 # Redis cache

@@ -1,7 +1,8 @@
 """POST /api/export — Excel workbook generation endpoint.
 
 Generates a formatted Excel workbook from enriched lead data and returns it
-as a streaming download.
+as a streaming download.  Includes verification confidence and sqft source
+columns for data-quality transparency.
 """
 from __future__ import annotations
 
@@ -29,10 +30,20 @@ COLUMNS: list[tuple[str, int]] = [
     ("Phone", 20),
     ("Website", 34),
     ("Estimated Sq Ft", 18),
+    ("Sq Ft Source", 14),
     ("Size Tier", 13),
+    ("Confidence", 13),
 ]
 
 _SQFT_COLUMN_INDEX = 8  # 1-based index of the "Estimated Sq Ft" column
+
+_SQFT_SOURCE_LABELS: dict[str, str] = {
+    "osm": "OSM",
+    "osm_wide": "OSM (wide)",
+    "viewport": "Estimate",
+    "none": "",
+    "": "",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +60,10 @@ class LeadRow(BaseModel):
         website: Homepage URL.
         postcode: 5-digit Malaysian postcode.
         sqft: Estimated building area in square feet.
+        sqft_source: How the sqft was derived (osm, viewport, etc.).
         size_tier: Classified size tier (Small / Medium / Large / Unknown).
         description: AI-generated business description.
+        confidence: Verification confidence (high / medium / low / unverified).
     """
 
     name: str = ""
@@ -60,8 +73,10 @@ class LeadRow(BaseModel):
     website: str = ""
     postcode: str = ""
     sqft: int | None = None
+    sqft_source: str = ""
     size_tier: str = ""
     description: str = ""
+    confidence: str = ""
 
 
 class ExportRequest(BaseModel):
@@ -87,6 +102,7 @@ def _extract_row_values(row_index: int, row_data: dict[str, Any]) -> list[Any]:
     Returns:
         List of values matching the ``COLUMNS`` order.
     """
+    source = row_data.get("sqft_source", "")
     return [
         row_index,
         row_data.get("postcode", ""),
@@ -96,7 +112,9 @@ def _extract_row_values(row_index: int, row_data: dict[str, Any]) -> list[Any]:
         row_data.get("phone", ""),
         row_data.get("website", ""),
         row_data.get("sqft"),
+        _SQFT_SOURCE_LABELS.get(source, source),
         row_data.get("size_tier", ""),
+        (row_data.get("confidence", "") or "").capitalize(),
     ]
 
 

@@ -1,5 +1,15 @@
 "use client";
 import { useState, useCallback, useRef, useEffect } from "react";
+interface Viewport {
+  northeast: { lat: number; lng: number };
+  southwest: { lat: number; lng: number };
+}
+interface Verification {
+  business_status: { status: string; pass: boolean; available: boolean };
+  website_liveness: { reachable: boolean; name_match: boolean; pass: boolean; available: boolean };
+  phone_valid: { valid: boolean; formatted: string; pass: boolean; available: boolean };
+  confidence: "high" | "medium" | "low" | "unverified";
+}
 interface Place {
   name: string;
   category: string;
@@ -10,9 +20,14 @@ interface Place {
   lng: number;
   postcode?: string;
   sqft?: number | null;
+  sqft_source?: string;
   size_tier?: string;
   enriched?: boolean;
   description?: string;
+  place_id?: string;
+  business_status?: string;
+  viewport?: Viewport;
+  verification?: Verification;
 }
 interface SavedSearchMeta {
   id: string;
@@ -21,14 +36,35 @@ interface SavedSearchMeta {
   date: string;
   count: number;
 }
-type Stage = "idle" | "searching" | "enriching" | "complete" | "error";
+type Stage = "idle" | "searching" | "enriching" | "verifying" | "complete" | "error";
 type SearchMode = "postcode" | "company";
 const BATCH_SIZE = 10;
 const DESCRIBE_BATCH_SIZE = 10;
 const CONCURRENT_DESCRIBE = 2;
 const CONCURRENT_ENRICH = 2;
+const VERIFY_BATCH_SIZE = 10;
 function formatSqft(n: number): string {
   return n.toLocaleString("en-US");
+}
+function sqftSourceLabel(source?: string): string | null {
+  if (!source || source === "osm") return null;
+  if (source === "osm_wide") return "~";
+  if (source === "viewport") return "~";
+  return null;
+}
+function confidenceBadge(confidence?: string) {
+  if (!confidence || confidence === "unverified") return <span className="text-slate-400 text-xs">--</span>;
+  const styles: Record<string, string> = {
+    high: "bg-emerald-100 text-emerald-700 border-emerald-300",
+    medium: "bg-amber-100 text-amber-700 border-amber-300",
+    low: "bg-red-100 text-red-700 border-red-300",
+  };
+  const icons: Record<string, string> = { high: "\u2713", medium: "\u25CB", low: "\u2717" };
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs font-semibold rounded border ${styles[confidence] || ""}`}>
+      {icons[confidence] || ""} {confidence.charAt(0).toUpperCase() + confidence.slice(1)}
+    </span>
+  );
 }
 function parsePostcodes(input: string): string[] {
   return input
@@ -74,6 +110,7 @@ export default function Home() {
   const withFootprint = places.filter((p) => p.sqft != null).length;
   const largeFacilities = places.filter((p) => p.size_tier === "Large").length;
   const postcodeCount = new Set(places.map((p) => p.postcode).filter(Boolean)).size;
+  const highConfidence = places.filter((p) => p.verification?.confidence === "high").length;
   useEffect(() => {
     fetch("/api/saves")
       .then((r) => r.json())
@@ -96,8 +133,10 @@ export default function Home() {
             name: p.name, category: p.category, address: p.address,
             phone: p.phone, website: p.website, lat: p.lat, lng: p.lng,
             postcode: p.postcode || "", sqft: p.sqft ?? null,
-            size_tier: p.size_tier || "", enriched: p.enriched ?? false,
-            description: p.description || "",
+            sqft_source: p.sqft_source || "", size_tier: p.size_tier || "",
+            enriched: p.enriched ?? false, description: p.description || "",
+            business_status: p.business_status || "",
+            confidence: p.verification?.confidence || "",
           })),
         }),
       });
@@ -191,6 +230,43 @@ export default function Home() {
     const workers = Array.from({ length: Math.min(CONCURRENT_DESCRIBE, jobs.length) }, () => runNext());
     await Promise.all(workers);
   }, []);
+  const fetchVerification = useCallback(async (allPlaces: Place[], abort: AbortController) => {
+    for (let i = 0; i < allPlaces.length; i += VERIFY_BATCH_SIZE) {
+      if (abort.signal.aborted) break;
+      const batch = allPlaces.slice(i, i + VERIFY_BATCH_SIZE);
+      try {
+        const res = await fetch("/api/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            leads: batch.map((p) => ({
+              name: p.name,
+              phone: p.phone || "",
+              website: p.website || "",
+              business_status: p.business_status || "",
+            })),
+          }),
+          signal: abort.signal,
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { results: { name: string; verification: Verification }[] };
+          const start = i;
+          setPlaces((prev) => {
+            const updated = [...prev];
+            data.results.forEach((r, idx) => {
+              const globalIdx = start + idx;
+              if (globalIdx < updated.length) {
+                updated[globalIdx] = { ...updated[globalIdx], verification: r.verification };
+              }
+            });
+            return updated;
+          });
+        }
+      } catch {
+        if (abort.signal.aborted) break;
+      }
+    }
+  }, []);
   const runPipeline = useCallback(async () => {
     const isCompanyMode = searchMode === "company";
     const postcodes = isCompanyMode ? [] : parsePostcodes(input);
@@ -279,7 +355,7 @@ export default function Home() {
         for (let i = 0; i < deduped.length; i += BATCH_SIZE) {
           enrichJobs.push({
             start: i,
-            batch: deduped.slice(i, i + BATCH_SIZE).map((p) => ({ lat: p.lat, lng: p.lng, name: p.name })),
+            batch: deduped.slice(i, i + BATCH_SIZE).map((p) => ({ lat: p.lat, lng: p.lng, name: p.name, viewport: p.viewport || null, business_type: p.category || "", address: p.address || "" })),
           });
         }
         let enrichCount = 0;
@@ -298,14 +374,14 @@ export default function Home() {
               });
               if (enrichRes.ok) {
                 const { results } = (await enrichRes.json()) as {
-                  results: { name: string; sqft: number | null; size_tier: string }[];
+                  results: { name: string; sqft: number | null; size_tier: string; sqft_source: string }[];
                 };
                 setPlaces((prev) => {
                   const updated = [...prev];
                   results.forEach((r, idx) => {
                     const globalIdx = start + idx;
                     if (globalIdx < updated.length) {
-                      updated[globalIdx] = { ...updated[globalIdx], sqft: r.sqft, size_tier: r.size_tier, enriched: true };
+                      updated[globalIdx] = { ...updated[globalIdx], sqft: r.sqft, size_tier: r.size_tier, sqft_source: r.sqft_source, enriched: true };
                     }
                   });
                   return updated;
@@ -335,18 +411,23 @@ export default function Home() {
       setPlaces((prev) =>
         prev.map((p) => ({ ...p, description: p.description || "No description available", enriched: true }))
       );
+      // Verification step
+      setStage("verifying");
+      await fetchVerification(deduped, abort);
       setStage("complete");
     } catch (err: unknown) {
       if (abort.signal.aborted) return;
       setError(err instanceof Error ? err.message : "An unexpected error occurred.");
       setStage("error");
     }
-  }, [input, searchMode, fetchDescriptions]);
+  }, [input, searchMode, fetchDescriptions, fetchVerification]);
   const handleExport = useCallback(async () => {
     const rows = places.map((p) => ({
       name: p.name, category: p.category, address: p.address,
       phone: p.phone, website: p.website, postcode: p.postcode || "",
-      sqft: p.sqft ?? null, size_tier: p.size_tier || "Unknown", description: p.description || "",
+      sqft: p.sqft ?? null, sqft_source: p.sqft_source || "",
+      size_tier: p.size_tier || "Unknown", description: p.description || "",
+      confidence: p.verification?.confidence || "",
     }));
     const res = await fetch("/api/export", {
       method: "POST",
@@ -373,7 +454,7 @@ export default function Home() {
     setSearchProgress("");
     setInput("");
   };
-  const isRunning = stage === "searching" || stage === "enriching";
+  const isRunning = stage === "searching" || stage === "enriching" || stage === "verifying";
   const postcodes = parsePostcodes(input);
   const companyNames = parseCompanyNames(input);
   const hasValidInput = searchMode === "company" ? companyNames.length > 0 : postcodes.length > 0;
@@ -506,7 +587,9 @@ export default function Home() {
               <StepConnector />
               <StepIndicator label={`Searching Places${totalLeads > 0 ? ` (${totalLeads})` : ""}`} status={stage === "searching" ? "active" : totalLeads > 0 ? "done" : "pending"} />
               <StepConnector />
-              <StepIndicator label={`Enriching${enrichedCount > 0 ? ` (${enrichedCount}/${totalLeads})` : ""}`} status={stage === "enriching" ? "active" : stage === "complete" ? "done" : "pending"} />
+              <StepIndicator label={`Enriching${enrichedCount > 0 ? ` (${enrichedCount}/${totalLeads})` : ""}`} status={stage === "enriching" ? "active" : (stage === "verifying" || stage === "complete") ? "done" : "pending"} />
+              <StepConnector />
+              <StepIndicator label="Verifying" status={stage === "verifying" ? "active" : stage === "complete" ? "done" : "pending"} />
               <StepConnector />
               <StepIndicator label="Complete" status={stage === "complete" ? "done" : "pending"} />
             </div>
@@ -516,7 +599,7 @@ export default function Home() {
           <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <StatCard label="Total Leads" value={totalLeads.toString()} />
             <StatCard label="Large Facilities" value={largeFacilities.toString()} accent="emerald" />
-            <StatCard label="With Footprint" value={`${withFootprint} / ${totalLeads}`} />
+            <StatCard label="Verified (High)" value={highConfidence > 0 ? `${highConfidence} / ${totalLeads}` : `${withFootprint} / ${totalLeads}`} />
             <StatCard label="Postcodes Searched" value={postcodeCount.toString()} accent="blue" />
           </section>
         )}
@@ -555,6 +638,7 @@ export default function Home() {
                     <th className="text-left px-4 py-3 font-semibold text-slate-600">Website</th>
                     <th className="text-right px-4 py-3 font-semibold text-slate-600">Est. Sq Ft</th>
                     <th className="text-center px-4 py-3 font-semibold text-slate-600">Size Tier</th>
+                    <th className="text-center px-4 py-3 font-semibold text-slate-600">Confidence</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -576,10 +660,15 @@ export default function Home() {
                         ) : <span className="text-slate-400">--</span>}
                       </td>
                       <td className="px-4 py-3 text-right font-mono">
-                        {!p.enriched ? <span className="skeleton inline-block w-16 h-4" /> : p.sqft != null ? formatSqft(p.sqft) : <span className="text-slate-400">N/A</span>}
+                        {!p.enriched ? <span className="skeleton inline-block w-16 h-4" /> : p.sqft != null ? (
+                          <span>{sqftSourceLabel(p.sqft_source) && <span className="text-amber-500 mr-0.5" title={`Source: ${p.sqft_source === "viewport" ? "Google estimate" : "OSM (wide radius)"}`}>{sqftSourceLabel(p.sqft_source)}</span>}{formatSqft(p.sqft)}</span>
+                        ) : <span className="text-slate-400">N/A</span>}
                       </td>
                       <td className="px-4 py-3 text-center">
                         {!p.enriched ? <span className="skeleton inline-block w-14 h-4" /> : tierBadge(p.size_tier || "Unknown")}
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        {!p.verification ? <span className="skeleton inline-block w-14 h-4" /> : confidenceBadge(p.verification.confidence)}
                       </td>
                     </tr>
                   ))}
