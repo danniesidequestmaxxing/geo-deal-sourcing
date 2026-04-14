@@ -50,6 +50,7 @@ function sqftSourceLabel(source?: string): string | null {
   if (!source || source === "osm") return null;
   if (source === "osm_wide") return "~";
   if (source === "viewport") return "~";
+  if (source === "category") return "~";
   return null;
 }
 function confidenceBadge(confidence?: string) {
@@ -661,7 +662,7 @@ export default function Home() {
                       </td>
                       <td className="px-4 py-3 text-right font-mono">
                         {!p.enriched ? <span className="skeleton inline-block w-16 h-4" /> : p.sqft != null ? (
-                          <span>{sqftSourceLabel(p.sqft_source) && <span className="text-amber-500 mr-0.5" title={`Source: ${p.sqft_source === "viewport" ? "Google estimate" : "OSM (wide radius)"}`}>{sqftSourceLabel(p.sqft_source)}</span>}{formatSqft(p.sqft)}</span>
+                          <span>{sqftSourceLabel(p.sqft_source) && <span className="text-amber-500 mr-0.5" title={`Source: ${p.sqft_source === "category" ? "Category estimate" : p.sqft_source === "viewport" ? "Google estimate" : "OSM (wide radius)"}`}>{sqftSourceLabel(p.sqft_source)}</span>}{formatSqft(p.sqft)}</span>
                         ) : <span className="text-slate-400">N/A</span>}
                       </td>
                       <td className="px-4 py-3 text-center">

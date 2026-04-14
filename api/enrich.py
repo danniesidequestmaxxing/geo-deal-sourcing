@@ -159,11 +159,17 @@ async def enrich(body: EnrichRequest) -> JSONResponse:
         for place in batch:
             cache_hit, sqft, source = _read_cache(r, place.lat, place.lng)
 
+            # Re-run the fallback chain for stale "none" cache entries
+            # (from before the category-based fallback was added).
+            if cache_hit and source == "none" and sqft is None:
+                cache_hit = False
+
             if not cache_hit:
                 sqft, source = estimate_building_sqft_with_fallback(
                     place.lat,
                     place.lng,
                     viewport=place.viewport,
+                    business_type=place.business_type,
                 )
                 _write_cache(r, place.lat, place.lng, sqft, source)
                 time.sleep(INTER_QUERY_DELAY)
