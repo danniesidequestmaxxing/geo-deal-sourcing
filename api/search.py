@@ -265,6 +265,14 @@ def _search_by_postcode(
 
     enriched = _filter_junk(enriched)
 
+    # Filter out results whose address postcode doesn't match the search.
+    # Google Places text search uses location/radius as a bias, not a hard
+    # boundary, so results from distant postcodes frequently appear.
+    enriched = [
+        e for e in enriched
+        if e.get("postcode", "") == postcode
+    ]
+
     return JSONResponse(content={
         "places": enriched,
         "count": len(enriched),
