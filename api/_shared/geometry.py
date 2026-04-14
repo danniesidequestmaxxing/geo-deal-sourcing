@@ -14,6 +14,8 @@ from typing import Any
 import overpy
 
 from api._shared.constants import (
+    CATEGORY_SQFT_DEFAULTS,
+    CATEGORY_SQFT_FALLBACK,
     MAX_OVERPASS_RETRIES,
     MAX_VIEWPORT_SQFT,
     OVERPASS_RADIUS_M,
@@ -204,10 +206,35 @@ def estimate_sqft_from_viewport(viewport: dict[str, Any] | None) -> float | None
     ]
     area_sqft = polygon_area_sq_m(coords) * SQ_M_TO_SQ_FT
 
+    # Cap unreasonably large viewports instead of discarding them entirely.
     if area_sqft > MAX_VIEWPORT_SQFT:
-        return None
+        area_sqft = MAX_VIEWPORT_SQFT
 
     return area_sqft * VIEWPORT_BUILDING_RATIO
+
+
+# ---------------------------------------------------------------------------
+# Category-based estimation
+# ---------------------------------------------------------------------------
+def estimate_sqft_from_category(business_type: str) -> float:
+    """Estimate building area from the Google Places business category.
+
+    Scans the category string for known keywords and returns the first
+    matching default.  Falls back to :data:`CATEGORY_SQFT_FALLBACK` when
+    no keywords match.
+
+    Args:
+        business_type: Comma-separated category string from Google Places
+            (e.g. ``"Factory, General Contractor"``).
+
+    Returns:
+        Estimated square feet (always a positive number).
+    """
+    lower = business_type.lower()
+    for keyword, sqft in CATEGORY_SQFT_DEFAULTS.items():
+        if keyword in lower:
+            return float(sqft)
+    return float(CATEGORY_SQFT_FALLBACK)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +244,8 @@ def estimate_building_sqft_with_fallback(
     lat: float,
     lng: float,
     viewport: dict[str, Any] | None = None,
-) -> tuple[float | None, str]:
+    business_type: str = "",
+) -> tuple[float, str]:
     """Estimate building footprint using a multi-source fallback chain.
 
     The chain tries, in order:
@@ -227,11 +255,14 @@ def estimate_building_sqft_with_fallback(
        coordinate misalignment.
     3. **Google viewport estimate** — always available when the search
        response included geometry data.
+    4. **Category-based default** — uses typical building sizes for the
+       business type.  Guarantees a value is always returned.
 
     Args:
         lat: Latitude of the target location.
         lng: Longitude of the target location.
         viewport: Optional Google Places ``geometry.viewport`` dict.
+        business_type: Google Places category string (e.g. ``"Factory"``).
 
     Returns:
         A ``(sqft, source)`` tuple where *source* is one of:
@@ -239,7 +270,7 @@ def estimate_building_sqft_with_fallback(
         - ``"osm"`` — Overpass at 80 m radius
         - ``"osm_wide"`` — Overpass at 200 m radius
         - ``"viewport"`` — Google Places viewport estimate
-        - ``"none"`` — all sources failed
+        - ``"category"`` — category-based default estimate
     """
     # 1. Overpass at default radius (80 m) — full retry
     sqft = _overpass_building_query(lat, lng, OVERPASS_RADIUS_M)
@@ -258,7 +289,8 @@ def estimate_building_sqft_with_fallback(
     if sqft is not None:
         return sqft, "viewport"
 
-    return None, "none"
+    # 4. Category-based default — always returns a value
+    return estimate_sqft_from_category(business_type), "category"
 
 
 # ---------------------------------------------------------------------------

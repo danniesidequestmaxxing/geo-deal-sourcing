@@ -33,6 +33,38 @@ TIER_SMALL_MAX: int = 20_000
 TIER_MEDIUM_MAX: int = 100_000
 
 # ---------------------------------------------------------------------------
+# Category-based default square-footage estimates
+# ---------------------------------------------------------------------------
+# When all geometric methods fail (Overpass + viewport), we fall back to a
+# reasonable estimate based on the Google Places business category.  These
+# numbers represent typical Malaysian industrial/commercial building sizes.
+CATEGORY_SQFT_DEFAULTS: dict[str, int] = {
+    "factory": 45_000,
+    "manufacturing": 45_000,
+    "warehouse": 35_000,
+    "industrial": 40_000,
+    "logistics": 30_000,
+    "storage": 25_000,
+    "engineering": 20_000,
+    "trading": 15_000,
+    "enterprise": 15_000,
+    "office": 10_000,
+    "wholesale": 20_000,
+    "construction": 25_000,
+    "food": 12_000,
+    "chemical": 30_000,
+    "textile": 25_000,
+    "metal": 30_000,
+    "plastic": 25_000,
+    "electronics": 20_000,
+    "furniture": 20_000,
+    "automotive": 25_000,
+    "pharmaceutical": 25_000,
+    "printing": 15_000,
+}
+CATEGORY_SQFT_FALLBACK: int = 15_000  # generic default when no category matches
+
+# ---------------------------------------------------------------------------
 # Revenue estimation
 # ---------------------------------------------------------------------------
 REVENUE_PER_SQFT: int = 150

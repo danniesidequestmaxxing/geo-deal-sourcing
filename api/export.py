@@ -40,7 +40,8 @@ _SQFT_COLUMN_INDEX = 8  # 1-based index of the "Estimated Sq Ft" column
 _SQFT_SOURCE_LABELS: dict[str, str] = {
     "osm": "OSM",
     "osm_wide": "OSM (wide)",
-    "viewport": "Estimate",
+    "viewport": "Viewport",
+    "category": "Category",
     "none": "",
     "": "",
 }
