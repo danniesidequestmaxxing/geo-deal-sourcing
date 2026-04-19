@@ -1,5 +1,8 @@
 "use client";
 import { useState, useCallback, useRef, useEffect } from "react";
+import dynamic from "next/dynamic";
+
+const PolygonMap = dynamic(() => import("./PolygonMap"), { ssr: false });
 interface Viewport {
   northeast: { lat: number; lng: number };
   southwest: { lat: number; lng: number };
@@ -37,7 +40,7 @@ interface SavedSearchMeta {
   count: number;
 }
 type Stage = "idle" | "searching" | "enriching" | "verifying" | "complete" | "error";
-type SearchMode = "postcode" | "company";
+type SearchMode = "postcode" | "company" | "area";
 const BATCH_SIZE = 10;
 const DESCRIBE_BATCH_SIZE = 10;
 const CONCURRENT_DESCRIBE = 2;
@@ -97,6 +100,7 @@ function tierBadge(tier: string) {
 export default function Home() {
   const [input, setInput] = useState("");
   const [searchMode, setSearchMode] = useState<SearchMode>("postcode");
+  const [polygon, setPolygon] = useState<[number, number][]>([]);
   const [stage, setStage] = useState<Stage>("idle");
   const [places, setPlaces] = useState<Place[]>([]);
   const [enrichedCount, setEnrichedCount] = useState(0);
@@ -270,11 +274,20 @@ export default function Home() {
   }, []);
   const runPipeline = useCallback(async () => {
     const isCompanyMode = searchMode === "company";
-    const postcodes = isCompanyMode ? [] : parsePostcodes(input);
+    const isAreaMode = searchMode === "area";
+    const postcodes = isCompanyMode || isAreaMode ? [] : parsePostcodes(input);
     const companies = isCompanyMode ? parseCompanyNames(input) : [];
-    const searchItems = isCompanyMode ? companies : postcodes;
+    const searchItems = isAreaMode
+      ? ["area"]
+      : isCompanyMode
+        ? companies
+        : postcodes;
 
-    if (searchItems.length === 0) {
+    if (isAreaMode && polygon.length < 3) {
+      setError("Please draw an area on the map (at least 3 vertices).");
+      return;
+    }
+    if (!isAreaMode && searchItems.length === 0) {
       setError(
         isCompanyMode
           ? "Please enter one or more company names (comma or newline separated)."
@@ -296,14 +309,18 @@ export default function Home() {
         if (abort.signal.aborted) break;
         const item = searchItems[i];
         setSearchProgress(
-          isCompanyMode
-            ? `Looking up company ${i + 1}/${searchItems.length} (${item})...`
-            : `Searching postcode ${i + 1}/${searchItems.length} (${item})...`,
+          isAreaMode
+            ? `Searching drawn area...`
+            : isCompanyMode
+              ? `Looking up company ${i + 1}/${searchItems.length} (${item})...`
+              : `Searching postcode ${i + 1}/${searchItems.length} (${item})...`,
         );
         try {
-          const body = isCompanyMode
-            ? { mode: "company", company: item }
-            : { mode: "postcode", postcode: item };
+          const body = isAreaMode
+            ? { mode: "polygon", polygon }
+            : isCompanyMode
+              ? { mode: "company", company: item }
+              : { mode: "postcode", postcode: item };
           const searchRes = await fetch("/api/search", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -317,7 +334,7 @@ export default function Home() {
             if (foundPlaces.length === 0 && data.debug) {
               debugMessages.push(`${item}: ${(data.debug as string[]).join("; ")}`);
             }
-            const tagged = foundPlaces.map((p) => ({ ...p, postcode: isCompanyMode ? "" : item, enriched: false }));
+            const tagged = foundPlaces.map((p) => ({ ...p, postcode: (isCompanyMode || isAreaMode) ? (p.postcode || "") : item, enriched: false }));
             allPlaces.push(...tagged);
             setPlaces([...allPlaces]);
           } else {
@@ -331,9 +348,11 @@ export default function Home() {
       setSearchProgress("");
       if (allPlaces.length === 0) {
         throw new Error(
-          isCompanyMode
-            ? `No results found. Check the company names and try again.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`
-            : `No results found. Try nearby industrial areas.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`,
+          isAreaMode
+            ? `No results found inside the drawn area. Try a larger polygon.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`
+            : isCompanyMode
+              ? `No results found. Check the company names and try again.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`
+              : `No results found. Try nearby industrial areas.${debugMessages.length > 0 ? " Debug: " + debugMessages.join(" | ") : ""}`,
         );
       }
       if (skipped.length > 0) {
@@ -420,7 +439,7 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "An unexpected error occurred.");
       setStage("error");
     }
-  }, [input, searchMode, fetchDescriptions, fetchVerification]);
+  }, [input, searchMode, polygon, fetchDescriptions, fetchVerification]);
   const handleExport = useCallback(async () => {
     const rows = places.map((p) => ({
       name: p.name, category: p.category, address: p.address,
@@ -453,6 +472,7 @@ export default function Home() {
     setError("");
     setSearchProgress("");
     setInput("");
+    setPolygon([]);
   };
   const isRunning = stage === "searching" || stage === "enriching" || stage === "verifying";
   const postcodes = parsePostcodes(input);
@@ -536,7 +556,40 @@ export default function Home() {
             >
               By Company Name
             </button>
+            <button
+              onClick={() => { if (!isRunning) { setSearchMode("area"); setInput(""); } }}
+              className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${searchMode === "area" ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+            >
+              Draw Area
+            </button>
           </div>
+          {searchMode === "area" ? (
+            <>
+              <PolygonMap polygon={polygon} onChange={setPolygon} />
+              <div className="flex items-center gap-3 mt-4">
+                <p className="flex-1 text-xs text-slate-500">
+                  {polygon.length === 0
+                    ? "Click on the map to start drawing the search area."
+                    : `${polygon.length} vertex${polygon.length === 1 ? "" : "es"} drawn${polygon.length < 3 ? ` — need ${3 - polygon.length} more` : " — ready to search"}`}
+                </p>
+                {polygon.length > 0 && !isRunning && (
+                  <button onClick={() => setPolygon([])}
+                    className="rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 font-medium px-4 py-2 text-sm transition-colors whitespace-nowrap">
+                    Clear
+                  </button>
+                )}
+                <button onClick={runPipeline} disabled={isRunning || polygon.length < 3}
+                  className="rounded-lg bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold px-6 py-2.5 text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 whitespace-nowrap">
+                  {isRunning ? (
+                    <><svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>Processing...</>
+                  ) : "Search Area"}
+                </button>
+                {(stage === "complete" || stage === "error" || places.length > 0) && !isRunning && (
+                  <button onClick={handleReset} className="rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 font-medium px-4 py-2.5 text-sm transition-colors whitespace-nowrap">Reset</button>
+                )}
+              </div>
+            </>
+          ) : (
           <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-end">
             <div className="flex-1 w-full">
               <label htmlFor="searchInput" className="block text-sm font-medium text-slate-700 mb-1">
@@ -577,6 +630,7 @@ export default function Home() {
               <button onClick={handleReset} className="rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 font-medium px-4 py-2.5 text-sm transition-colors whitespace-nowrap">Reset</button>
             )}
           </div>
+          )}
           {searchProgress && <div className="mt-3 text-sm text-blue-600 font-medium">{searchProgress}</div>}
           {error && <div className="mt-4 bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">{error}</div>}
         </section>
@@ -685,12 +739,16 @@ export default function Home() {
               </svg>
             </div>
             <h3 className="text-lg font-semibold text-slate-700 mb-1">
-              {searchMode === "company" ? "Look Up Companies" : "Enter Malaysia Postcodes"}
+              {searchMode === "area"
+                ? "Draw an Area on the Map"
+                : searchMode === "company" ? "Look Up Companies" : "Enter Malaysia Postcodes"}
             </h3>
             <p className="text-sm text-slate-500 max-w-md mx-auto">
-              {searchMode === "company"
-                ? "Enter company names to look up their details, building footprint, and AI-powered descriptions."
-                : "Enter one or more postcodes to search for businesses. Results are enriched with building footprint data and AI-powered business descriptions."}
+              {searchMode === "area"
+                ? "Click on the map above to define a custom search boundary. Results will only include businesses inside your drawn polygon."
+                : searchMode === "company"
+                  ? "Enter company names to look up their details, building footprint, and AI-powered descriptions."
+                  : "Enter one or more postcodes to search for businesses. Results are enriched with building footprint data and AI-powered business descriptions."}
             </p>
             <div className="mt-6 flex flex-wrap justify-center gap-2 text-xs text-slate-400">
               {searchMode === "company" ? (<>
