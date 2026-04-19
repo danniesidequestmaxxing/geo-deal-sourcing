@@ -62,13 +62,16 @@ class SearchRequest(BaseModel):
 
     Attributes:
         postcode: A 5-digit Malaysian postcode (postcode mode).
-        mode: Either ``"postcode"`` or ``"company"``.
+        mode: Either ``"postcode"``, ``"company"``, or ``"polygon"``.
         company: Company name to look up (company mode).
+        polygon: List of ``[lat, lng]`` pairs forming a closed polygon
+            (polygon mode).  Minimum 3 vertices.
     """
 
     postcode: str = ""
     mode: str = "postcode"
     company: str = ""
+    polygon: list[list[float]] = []
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,58 @@ _DETAIL_FIELDS: list[str] = [
     "type",
     "business_status",
 ]
+
+
+def _polygon_centroid(polygon: list[list[float]]) -> tuple[float, float]:
+    """Return the arithmetic centroid of a polygon's vertices."""
+    lat = sum(p[0] for p in polygon) / len(polygon)
+    lng = sum(p[1] for p in polygon) / len(polygon)
+    return lat, lng
+
+
+def _polygon_radius_m(polygon: list[list[float]], centroid: tuple[float, float]) -> float:
+    """Return the max distance (metres) from centroid to any vertex.
+
+    Uses the equirectangular approximation, which is adequate for the
+    small distances involved in a Malaysian industrial search area.
+    """
+    import math
+    clat, clng = centroid
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lng = 111_320.0 * math.cos(math.radians(clat))
+    best = 0.0
+    for lat, lng in polygon:
+        dx = (lng - clng) * m_per_deg_lng
+        dy = (lat - clat) * m_per_deg_lat
+        d = math.hypot(dx, dy)
+        if d > best:
+            best = d
+    return best
+
+
+def _point_in_polygon(lat: float, lng: float, polygon: list[list[float]]) -> bool:
+    """Ray-casting point-in-polygon test.
+
+    Args:
+        lat: Point latitude.
+        lng: Point longitude.
+        polygon: List of ``[lat, lng]`` pairs.
+
+    Returns:
+        True if the point is inside the polygon.
+    """
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        lat_i, lng_i = polygon[i]
+        lat_j, lng_j = polygon[j]
+        if ((lng_i > lng) != (lng_j > lng)) and (
+            lat < (lat_j - lat_i) * (lng - lng_i) / (lng_j - lng_i + 1e-12) + lat_i
+        ):
+            inside = not inside
+        j = i
+    return inside
 
 
 def _extract_postcode(address: str) -> str:
@@ -283,6 +338,102 @@ def _search_by_postcode(
 
 
 # ---------------------------------------------------------------------------
+# Polygon-based search
+# ---------------------------------------------------------------------------
+def _search_by_polygon(
+    gmaps: googlemaps.Client,
+    polygon: list[list[float]],
+) -> JSONResponse:
+    """Search for businesses inside a user-drawn polygon.
+
+    Computes the polygon centroid and a radius covering all vertices,
+    runs the standard keyword-based Google Places search biased to that
+    area, and filters the enriched results using a point-in-polygon test.
+
+    Args:
+        gmaps: Authenticated Google Maps client.
+        polygon: List of ``[lat, lng]`` pairs (minimum 3 vertices).
+
+    Returns:
+        JSON response with ``places``, ``count``, ``polygon``, ``centroid``.
+
+    Raises:
+        HTTPException: If the polygon has fewer than 3 vertices.
+    """
+    if len(polygon) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Polygon must have at least 3 vertices.",
+        )
+
+    centroid_lat, centroid_lng = _polygon_centroid(polygon)
+    radius_m = int(_polygon_radius_m(polygon, (centroid_lat, centroid_lng)))
+    # Cap radius to Google Places' 50 km max; also ensure a minimum.
+    radius_m = max(500, min(radius_m, 50_000))
+
+    seen_ids: set[str] = set()
+    raw_places: list[dict[str, Any]] = []
+    debug_log: list[str] = []
+
+    for keyword in SEARCH_KEYWORDS:
+        query = f"{keyword} Malaysia"
+        try:
+            resp = gmaps.places(
+                query=query,
+                location=(centroid_lat, centroid_lng),
+                radius=radius_m,
+            )
+            debug_log.append(
+                f"{keyword}: status={resp.get('status', '?')}, "
+                f"results={len(resp.get('results', []))}"
+            )
+        except Exception as exc:
+            debug_log.append(f"{keyword}: EXCEPTION={exc}")
+            time.sleep(PLACES_DELAY)
+            continue
+
+        for place in resp.get("results", []):
+            pid = place["place_id"]
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                raw_places.append(place)
+        time.sleep(PLACES_DELAY)
+
+    if not raw_places:
+        return JSONResponse(content={
+            "places": [],
+            "count": 0,
+            "polygon": polygon,
+            "centroid": {"lat": centroid_lat, "lng": centroid_lng},
+            "debug": debug_log,
+        })
+
+    enriched = [
+        row
+        for place in raw_places
+        if (row := _enrich_place(gmaps, place, centroid_lat, centroid_lng)) is not None
+    ]
+    for _ in enriched:
+        time.sleep(DETAILS_DELAY)
+
+    enriched = _filter_junk(enriched)
+
+    # Filter to points inside the drawn polygon.
+    enriched = [
+        e for e in enriched
+        if _point_in_polygon(e["lat"], e["lng"], polygon)
+    ]
+
+    return JSONResponse(content={
+        "places": enriched,
+        "count": len(enriched),
+        "polygon": polygon,
+        "centroid": {"lat": centroid_lat, "lng": centroid_lng},
+        "debug": debug_log,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Company-name search
 # ---------------------------------------------------------------------------
 def _search_by_company(
@@ -365,4 +516,6 @@ async def search(body: SearchRequest) -> JSONResponse:
 
     if body.mode == "company":
         return _search_by_company(gmaps, body.company)
+    if body.mode == "polygon":
+        return _search_by_polygon(gmaps, body.polygon)
     return _search_by_postcode(gmaps, body.postcode)
