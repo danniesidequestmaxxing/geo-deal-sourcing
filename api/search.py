@@ -347,8 +347,8 @@ def _search_by_polygon(
     """Search for businesses inside a user-drawn polygon.
 
     Computes the polygon centroid and a radius covering all vertices,
-    runs the standard keyword-based Google Places search biased to that
-    area, and filters the enriched results using a point-in-polygon test.
+    runs a Nearby Search (hard radius boundary) for each keyword,
+    and filters the enriched results using a point-in-polygon test.
 
     Args:
         gmaps: Authenticated Google Maps client.
@@ -376,12 +376,11 @@ def _search_by_polygon(
     debug_log: list[str] = []
 
     for keyword in SEARCH_KEYWORDS:
-        query = f"{keyword} Malaysia"
         try:
-            resp = gmaps.places(
-                query=query,
+            resp = gmaps.places_nearby(
                 location=(centroid_lat, centroid_lng),
                 radius=radius_m,
+                keyword=keyword,
             )
             debug_log.append(
                 f"{keyword}: status={resp.get('status', '?')}, "
