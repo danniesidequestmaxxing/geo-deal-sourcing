@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef } from "react";
-import type { Map as LeafletMap, Polygon as LeafletPolygon, Marker as LeafletMarker } from "leaflet";
+import { Loader } from "@googlemaps/js-api-loader";
 
 interface PolygonMapProps {
   polygon: [number, number][];
@@ -8,50 +8,71 @@ interface PolygonMapProps {
   height?: string;
 }
 
-const MALAYSIA_CENTER: [number, number] = [3.139, 101.686]; // Kuala Lumpur
+const MALAYSIA_CENTER = { lat: 3.139, lng: 101.686 };
 
 export default function PolygonMap({ polygon, onChange, height = "420px" }: PolygonMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<LeafletMap | null>(null);
-  const polyRef = useRef<LeafletPolygon | null>(null);
-  const markersRef = useRef<LeafletMarker[]>([]);
+  const mapRef = useRef<google.maps.Map | null>(null);
+  const polyRef = useRef<google.maps.Polygon | null>(null);
+  const markersRef = useRef<google.maps.Marker[]>([]);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
   useEffect(() => {
     let cancelled = false;
+    const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
+    const loader = new Loader({ apiKey, version: "weekly" });
+
     (async () => {
-      const L = (await import("leaflet")).default;
+      await loader.importLibrary("maps");
+      await loader.importLibrary("marker");
       if (cancelled || !containerRef.current || mapRef.current) return;
 
-      const map = L.map(containerRef.current).setView(MALAYSIA_CENTER, 7);
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19,
-        attribution: '&copy; OpenStreetMap contributors',
-      }).addTo(map);
+      const map = new google.maps.Map(containerRef.current, {
+        center: MALAYSIA_CENTER,
+        zoom: 7,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+        clickableIcons: false,
+      });
       mapRef.current = map;
 
       const redraw = () => {
         const pts = markersRef.current.map((m) => {
-          const ll = m.getLatLng();
-          return [ll.lat, ll.lng] as [number, number];
+          const pos = m.getPosition()!;
+          return [pos.lat(), pos.lng()] as [number, number];
         });
+        const path = pts.map(([lat, lng]) => ({ lat, lng }));
         if (polyRef.current) {
-          polyRef.current.setLatLngs(pts);
+          polyRef.current.setPath(path);
         } else if (pts.length >= 2) {
-          polyRef.current = L.polygon(pts, { color: "#059669", weight: 2, fillOpacity: 0.15 }).addTo(map);
+          polyRef.current = new google.maps.Polygon({
+            paths: path,
+            strokeColor: "#059669",
+            strokeWeight: 2,
+            fillColor: "#059669",
+            fillOpacity: 0.15,
+            clickable: false,
+            map,
+          });
         }
         onChangeRef.current(pts);
       };
 
-      map.on("click", (e: { latlng: { lat: number; lng: number } }) => {
-        const marker = L.marker(e.latlng, { draggable: true }).addTo(map);
-        marker.on("drag", redraw);
-        marker.on("click", () => {
-          map.removeLayer(marker);
+      map.addListener("click", (e: google.maps.MapMouseEvent) => {
+        if (!e.latLng) return;
+        const marker = new google.maps.Marker({
+          position: e.latLng,
+          draggable: true,
+          map,
+        });
+        marker.addListener("drag", redraw);
+        marker.addListener("click", () => {
+          marker.setMap(null);
           markersRef.current = markersRef.current.filter((m) => m !== marker);
           if (markersRef.current.length < 2 && polyRef.current) {
-            map.removeLayer(polyRef.current);
+            polyRef.current.setMap(null);
             polyRef.current = null;
           }
           redraw();
@@ -60,25 +81,26 @@ export default function PolygonMap({ polygon, onChange, height = "420px" }: Poly
         redraw();
       });
     })();
+
     return () => {
       cancelled = true;
-      if (mapRef.current) {
-        mapRef.current.remove();
-        mapRef.current = null;
+      markersRef.current.forEach((m) => m.setMap(null));
+      markersRef.current = [];
+      if (polyRef.current) {
+        polyRef.current.setMap(null);
         polyRef.current = null;
-        markersRef.current = [];
       }
+      mapRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
+    if (!mapRef.current) return;
     if (polygon.length === 0 && markersRef.current.length > 0) {
-      markersRef.current.forEach((m) => map.removeLayer(m));
+      markersRef.current.forEach((m) => m.setMap(null));
       markersRef.current = [];
       if (polyRef.current) {
-        map.removeLayer(polyRef.current);
+        polyRef.current.setMap(null);
         polyRef.current = null;
       }
     }
