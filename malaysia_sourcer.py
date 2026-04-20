@@ -27,9 +27,10 @@ import googlemaps
 import requests
 from bs4 import BeautifulSoup
 
-from api._shared.constants import SQ_M_TO_SQ_FT, WEB_SCRAPE_TIMEOUT
+from api._shared.constants import SQ_M_TO_SQ_FT, USER_AGENT, WEB_SCRAPE_TIMEOUT
 from api._shared.excel import create_workbook
 from api._shared.geometry import classify_size_tier, estimate_building_sqft
+from api._shared.google_maps import geocode_postcode
 
 logger = logging.getLogger(__name__)
 
@@ -79,29 +80,6 @@ _CLI_SQFT_COLUMN = 7  # 1-based index of "Sq Ft Estimate"
 # ---------------------------------------------------------------------------
 # Google Maps helpers
 # ---------------------------------------------------------------------------
-def _postcode_to_latlng(
-    gmaps: googlemaps.Client,
-    postcode: str,
-) -> tuple[float, float] | None:
-    """Geocode a Malaysian postcode to a (lat, lng) pair.
-
-    Args:
-        gmaps: Authenticated Google Maps client.
-        postcode: A 5-digit Malaysian postcode.
-
-    Returns:
-        A ``(latitude, longitude)`` tuple, or ``None`` if geocoding failed.
-    """
-    try:
-        results = gmaps.geocode(f"{postcode}, Malaysia")
-        if results:
-            loc = results[0]["geometry"]["location"]
-            return loc["lat"], loc["lng"]
-    except Exception as exc:
-        logger.warning("Geocode failed for %s: %s", postcode, exc)
-    return None
-
-
 def _search_places_for_postcode(
     gmaps: googlemaps.Client,
     postcode: str,
@@ -204,7 +182,7 @@ def _scrape_homepage_keywords(url: str) -> list[str]:
         resp = requests.get(
             url,
             timeout=WEB_SCRAPE_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; DealSourcerBot/1.0)"},
+            headers={"User-Agent": USER_AGENT},
         )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -341,7 +319,7 @@ def run(postcodes: list[str], api_key: str) -> None:
             continue
 
         logger.info("[%d/%d] Processing: %s", pc_idx, len(postcodes), postcode)
-        latlng = _postcode_to_latlng(gmaps, postcode)
+        latlng = geocode_postcode(gmaps, postcode)
         if not latlng:
             continue
         lat, lng = latlng

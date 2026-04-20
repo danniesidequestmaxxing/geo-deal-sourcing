@@ -1,63 +1,239 @@
 # Malaysia PE Deal Sourcer
 
 Web-based tool for identifying manufacturing and industrial acquisition targets
-in Malaysia by postcode. Searches Google Places, estimates building footprints
-via OpenStreetMap, and generates AI-powered business descriptions.
+in Malaysia. Searches Google Places, estimates building footprints via
+OpenStreetMap, and generates AI-powered business descriptions.
 
 ## How It Works
 
-1. Enter a 5-digit Malaysian postcode (e.g. `40000` for Shah Alam) or company name.
-2. The backend geocodes the input and searches Google Places for factories,
-   manufacturers, and industrial facilities within 5 km.
-3. Each facility's building footprint is estimated via OpenStreetMap (multiple
-   Overpass servers with failover + Redis caching).
-4. Claude AI generates a one-line business description from the company's website
-   content (or infers one from the name/category).
-5. Results are displayed with estimated square footage, size tier, and revenue proxy.
-6. Export the full dataset as a formatted Excel file, or save/load searches via Redis.
+```
+User Input (postcode / company name / drawn polygon)
+        │
+        ▼
+   ┌─────────┐     Google Places API (10 keyword searches,
+   │  SEARCH  │───► deduplicated, junk-filtered, postcode-matched)
+   └─────────┘
+        │
+        ▼
+   ┌─────────┐     Overpass 80m → Overpass 200m → Google viewport
+   │ ENRICH  │───► → Category default.  Redis-cached for 7 days.
+   └─────────┘
+        │
+        ▼
+   ┌──────────┐    Scrape homepage → Claude AI one-liner.
+   │ DESCRIBE │───► Falls back to inference from name/category.
+   └──────────┘
+        │
+        ▼
+   ┌──────────┐    Business status + website liveness + phone
+   │  VERIFY  │───► validation.  Produces confidence score.
+   └──────────┘
+        │
+        ▼
+   Results table with export to Excel / save to Redis
+```
+
+### Three search modes
+
+| Mode | Input | How it works |
+|------|-------|-------------|
+| **Postcode** | 5-digit Malaysian postcode | Geocode → 5 km radius text search → filter by postcode |
+| **Company** | Company name | Text search across Malaysia |
+| **Draw Area** | Polygon on Google Maps | Centroid + radius → Nearby Search → point-in-polygon filter |
 
 ## Architecture
 
 ```
-app/                    Next.js frontend (App Router)
-  layout.tsx            Root layout
-  page.tsx              Main single-page application
+app/                        Next.js 15 frontend (App Router)
+  layout.tsx                Root layout + metadata
+  page.tsx                  Main SPA — search, results table, export, saves
+  PolygonMap.tsx             Google Maps polygon-drawing component
+  globals.css               Tailwind v4 imports + custom animations
 
-api/                    Python serverless functions (Vercel)
-  search.py             POST /api/search   — Google Places discovery
-  enrich.py             POST /api/enrich   — Overpass building footprints
-  describe.py           POST /api/describe — Claude AI descriptions
-  export.py             POST /api/export   — Excel workbook generation
-  saves.py              GET|POST|DELETE /api/saves — Redis CRUD
+api/                        Python serverless functions (Vercel)
+  search.py                 POST /api/search   — Google Places discovery
+  enrich.py                 POST /api/enrich   — building footprint estimation
+  describe.py               POST /api/describe — Claude AI descriptions
+  verify.py                 POST /api/verify   — lead confidence scoring
+  export.py                 POST /api/export   — Excel workbook generation
+  saves.py                  GET|POST|DELETE /api/saves — Redis CRUD
 
-  _shared/              Shared Python utilities (not deployed as endpoints)
-    constants.py        Centralised configuration values
-    geometry.py         Shoelace polygon area + Overpass client
-    google_maps.py      Google Maps client factory
-    redis_client.py     Redis connection management (context manager)
-    excel.py            Styled Excel workbook generation
+  _shared/                  Shared utilities (not deployed as endpoints)
+    constants.py            All magic numbers and config values
+    geometry.py             Shoelace area, Overpass client, size tiers
+    google_maps.py          Google Maps client factory + geocoding
+    redis_client.py         Redis connection context manager
+    excel.py                Styled Excel workbook generator
 
-malaysia_sourcer.py     Standalone CLI tool (same pipeline, offline use)
+malaysia_sourcer.py         Standalone CLI tool (offline, no web server)
 ```
 
 ## Tech Stack
 
-| Layer      | Technology                                                  |
-|------------|-------------------------------------------------------------|
-| Frontend   | Next.js 15 (App Router), React 19, Tailwind CSS v4         |
-| Backend    | Python 3.10+, FastAPI (Vercel Serverless Functions)         |
-| APIs       | Google Places API, Overpass API (multi-server failover)     |
-| AI         | Claude API (Haiku) for business descriptions                |
-| Caching    | Redis (saved searches + building footprint cache)           |
-| Export     | openpyxl (formatted Excel workbooks)                        |
+| Layer | Technology |
+|-------|-----------|
+| Frontend | Next.js 15 (App Router), React 19, Tailwind CSS v4 |
+| Map | Google Maps JavaScript API (`@googlemaps/js-api-loader`) |
+| Backend | Python 3.10+, FastAPI (Vercel Serverless Functions) |
+| APIs | Google Places API, Overpass API (3-server failover) |
+| AI | Claude API (Haiku) for business descriptions |
+| Caching | Redis (building footprints + saved searches) |
+| Export | openpyxl (formatted Excel workbooks) |
 
-## Prerequisites
+## API Reference
 
-- **Node.js** >= 18
-- **Python** >= 3.10
-- **Google Maps API key** with Places API and Geocoding API enabled
-- **Anthropic API key** for AI-generated business descriptions
-- **Redis** (optional) for saved searches and footprint caching
+### `POST /api/search`
+
+Discover businesses via Google Places.
+
+**Request body:**
+```json
+{
+  "mode": "postcode | company | polygon",
+  "postcode": "40000",
+  "company": "Perodua",
+  "polygon": [[3.1, 101.6], [3.1, 101.7], [3.0, 101.7]]
+}
+```
+
+**Response:**
+```json
+{
+  "places": [
+    {
+      "name": "ABC Manufacturing Sdn Bhd",
+      "category": "Factory, Industrial",
+      "address": "Lot 5, ..., 40000 Shah Alam",
+      "phone": "+60 3-5191 1234",
+      "website": "https://abc.com",
+      "lat": 3.0856,
+      "lng": 101.5450,
+      "place_id": "ChIJ...",
+      "business_status": "OPERATIONAL",
+      "viewport": { ... },
+      "postcode": "40000"
+    }
+  ],
+  "count": 12,
+  "postcode": "40000",
+  "centroid": { "lat": 3.0856, "lng": 101.545 },
+  "debug": ["factory: status=OK, results=8", ...]
+}
+```
+
+### `POST /api/enrich`
+
+Estimate building footprint for a single place.
+
+**Request body:**
+```json
+{
+  "lat": 3.0856,
+  "lng": 101.545,
+  "viewport": { "northeast": { "lat": 3.087, "lng": 101.547 }, "southwest": { "lat": 3.084, "lng": 101.543 } },
+  "business_type": "Factory"
+}
+```
+
+**Response:**
+```json
+{
+  "sqft": 32500,
+  "source": "overpass_80m",
+  "size_tier": "Medium",
+  "revenue_proxy": 4875000
+}
+```
+
+Source values: `overpass_80m`, `overpass_200m`, `viewport`, `category`.
+
+### `POST /api/describe`
+
+Generate AI descriptions for businesses.
+
+**Request body:**
+```json
+{
+  "leads": [
+    { "name": "ABC Sdn Bhd", "category": "Factory", "address": "...", "website": "https://abc.com" }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "descriptions": [
+    { "description": "Precision metal stamping manufacturer supplying automotive OEMs across Southeast Asia." }
+  ]
+}
+```
+
+### `POST /api/verify`
+
+Verify lead quality with confidence scoring.
+
+**Request body:**
+```json
+{
+  "leads": [
+    { "name": "ABC Sdn Bhd", "phone": "+60312345678", "website": "https://abc.com", "business_status": "OPERATIONAL" }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "status_ok": true,
+      "website_live": true,
+      "name_match": true,
+      "phone_valid": true,
+      "confidence": "high"
+    }
+  ]
+}
+```
+
+### `POST /api/export`
+
+Generate a styled Excel workbook from results.
+
+### `GET /api/saves`
+
+List all saved searches from Redis.
+
+### `POST /api/saves`
+
+Save a search (name + places array) to Redis.
+
+### `DELETE /api/saves?name=search_name`
+
+Delete a saved search.
+
+## Environment Variables
+
+| Variable | Required | Where | Purpose |
+|----------|----------|-------|---------|
+| `GOOGLE_MAPS_API_KEY` | Yes | Backend | Google Places + Geocoding API |
+| `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` | Yes | Frontend | Google Maps JavaScript API (map tiles) |
+| `ANTHROPIC_API_KEY` | Yes | Backend | Claude AI descriptions |
+| `REDIS_URL` | No | Backend | Saved searches + footprint caching |
+
+**Google Cloud API setup:**
+
+The `GOOGLE_MAPS_API_KEY` needs these APIs enabled:
+- Places API
+- Geocoding API
+
+The `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` needs:
+- Maps JavaScript API
+
+These can be the same key or separate keys. Since `NEXT_PUBLIC_*` keys are
+exposed to the browser, consider restricting the frontend key by HTTP referrer
+(`*.vercel.app/*`) and limiting it to Maps JavaScript API only.
 
 ## Local Development
 
@@ -67,63 +243,79 @@ npm install
 pip install -r requirements.txt
 
 # 2. Set environment variables
-export GOOGLE_MAPS_API_KEY=your_key_here
-export ANTHROPIC_API_KEY=your_key_here
-export REDIS_URL=redis://localhost:6379          # optional
+export GOOGLE_MAPS_API_KEY=your_key
+export NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=your_key
+export ANTHROPIC_API_KEY=your_key
+export REDIS_URL=redis://localhost:6379  # optional
 
 # 3. Start the development server
 npx vercel dev
 ```
 
-The app will be available at `http://localhost:3000`.
+The app runs at `http://localhost:3000`.
 
-### CLI Tool
+## CLI Tool
 
-The standalone CLI performs the same pipeline offline and writes an Excel file:
+The standalone CLI runs the same pipeline offline and outputs an Excel file:
 
 ```bash
 # Search by postcodes
 python malaysia_sourcer.py --postcodes 40000 40100 40150
 
-# Search from a file (one postcode per line, # comments supported)
+# From a file (one postcode per line, # comments allowed)
 python malaysia_sourcer.py --file postcodes.txt
 
 # With explicit API key
 python malaysia_sourcer.py --postcodes 40000 --api-key YOUR_KEY
 ```
 
+The CLI uses the same shared utilities as the web API (`api/_shared/`) but has
+its own rate-limiting delays (slower, safer for batch runs) and search keywords
+(factory-focused rather than broad industrial).
+
 ## Deployment on Vercel
 
-### 1. Push to GitHub
+1. Push to GitHub
+2. Import at [vercel.com/new](https://vercel.com/new) → Framework: **Next.js**
+3. Add all environment variables (see table above) — make sure to check
+   **Production**, **Preview**, and **Development** for each
+4. Deploy — Vercel auto-detects the Python serverless functions in `api/`
 
-```bash
-git add .
-git commit -m "Initial commit"
-git push -u origin main
-```
+After adding or changing an env var, you must **redeploy** for it to take effect
+(`NEXT_PUBLIC_*` vars are baked in at build time).
 
-### 2. Import to Vercel
+## Sqft Estimation Fallback Chain
 
-1. Go to [vercel.com/new](https://vercel.com/new)
-2. Import your GitHub repository
-3. Framework Preset: **Next.js**
-4. Click **Deploy**
+Building footprints are estimated using a 4-step fallback:
 
-### 3. Add Environment Variables
+1. **Overpass 80m** — Query OSM for building polygons within 80m of the
+   coordinates. Calculate area with the shoelace formula. Most accurate.
+2. **Overpass 200m** — Widen the search radius. Catches buildings with
+   slightly offset coordinates.
+3. **Google viewport** — Use the Place Details `viewport` bounds, apply a
+   35% building ratio, cap at 2M sqft.
+4. **Category default** — Look up the business type in a table of typical
+   Malaysian industrial building sizes (e.g. factory → 45,000 sqft).
 
-In Vercel project settings (**Settings > Environment Variables**):
-
-| Variable              | Required | Description                              |
-|-----------------------|----------|------------------------------------------|
-| `GOOGLE_MAPS_API_KEY` | Yes      | Google Maps API key (Places + Geocoding) |
-| `ANTHROPIC_API_KEY`   | Yes      | Anthropic API key for Claude             |
-| `REDIS_URL`           | No       | Redis connection URL for persistence     |
+Results are cached in Redis for 7 days. Stale entries (where sqft is still
+null) are automatically re-estimated on the next request.
 
 ## Project Conventions
 
-- **Python**: PEP 8, type hints on all signatures, Google-style docstrings.
-- **Shared code** lives in `api/_shared/` (prefixed with `_` so Vercel skips it).
-- **Constants** are centralised in `api/_shared/constants.py`.
-- **Logging** via `logging` module (not `print()`).
-- **Resource management**: Redis connections use the `redis_connection()` context
-  manager from `api/_shared/redis_client.py`.
+- **Python**: PEP 8, type hints on all signatures, Google-style docstrings
+- **Shared code** lives in `api/_shared/` (prefixed with `_` so Vercel skips it)
+- **Constants** centralised in `api/_shared/constants.py` — no magic numbers
+- **Logging** via `logging` module (never `print()`)
+- **Redis**: use `redis_connection()` context manager from `api/_shared/redis_client.py`
+- **Error handling**: validate at system boundaries (user input, external APIs), trust internal code
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Map shows "For development purposes only" | `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` not set or Maps JavaScript API not enabled | Add the env var + enable the API in Google Cloud Console |
+| Map shows "Oops! Something went wrong" | API key restrictions block the domain | Add `*.vercel.app/*` to HTTP referrer allowlist, add Maps JavaScript API to API restrictions |
+| "No results found" on Draw Area | Google Places returned results outside polygon | Polygon search uses Nearby Search (hard boundary) — try drawing a larger area |
+| Sqft shows as N/A | All 4 fallback methods failed and cache has stale entry | Clear Redis cache or wait for TTL expiry (7 days) |
+| Vercel build fails | Missing env var or dependency | Check Vercel build logs; ensure `requirements.txt` is up to date |
+| Console shows `ApiTargetBlockedMapError` | API key restricted to wrong APIs | Add Maps JavaScript API to the key's allowed API list in Google Cloud |

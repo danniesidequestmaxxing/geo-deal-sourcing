@@ -87,6 +87,11 @@ WEB_SCRAPE_TIMEOUT: int = 6
 MAX_TEXT_PER_SITE: int = 1500
 BATCH_CAP: int = 10
 
+USER_AGENT: str = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 # ---------------------------------------------------------------------------
 # Rate-limiting delays (seconds)
 # ---------------------------------------------------------------------------

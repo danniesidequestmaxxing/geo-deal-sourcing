@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from api._shared.constants import BATCH_CAP
+from api._shared.constants import BATCH_CAP, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +30,6 @@ app = FastAPI()
 
 _PHONE_DEFAULT_REGION = "MY"
 _WEBSITE_TIMEOUT = 10.0
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +152,7 @@ async def _check_website(
             url,
             follow_redirects=True,
             timeout=_WEBSITE_TIMEOUT,
-            headers={"User-Agent": _USER_AGENT},
+            headers={"User-Agent": USER_AGENT},
         )
         reachable = resp.status_code == 200
 

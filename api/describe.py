@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from api._shared.constants import BATCH_CAP, MAX_TEXT_PER_SITE
+from api._shared.constants import BATCH_CAP, MAX_TEXT_PER_SITE, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +32,8 @@ _CLAUDE_MAX_TOKENS = 1024
 _CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 _CLAUDE_TIMEOUT = 30.0
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 _FETCH_HEADERS = {
-    "User-Agent": _USER_AGENT,
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
