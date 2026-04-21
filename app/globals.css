@@ -1,0 +1,37 @@
+@import "tailwindcss";
+:root {
+  --navy-900: #0f1a2e;
+  --navy-800: #1a2744;
+  --navy-700: #1f4e79;
+  --navy-600: #2563eb;
+  --slate-50: #f8fafc;
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-400: #94a3b8;
+  --slate-600: #475569;
+  --emerald-500: #10b981;
+  --amber-500: #f59e0b;
+  --red-500: #ef4444;
+}
+body {
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  background-color: var(--slate-50);
+  color: #1e293b;
+}
+@keyframes pulse-slow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-pulse-slow {
+  animation: pulse-slow 2s ease-in-out infinite;
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 4px;
+}
